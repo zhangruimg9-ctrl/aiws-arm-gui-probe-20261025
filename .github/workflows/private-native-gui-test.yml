@@ -44,8 +44,6 @@ jobs:
 
 
         run: |
-
-
           set -euo pipefail
 
 
@@ -82,28 +80,72 @@ jobs:
           current_pid=""
 
 
+          test_phase="input-preflight"
           cleanup() {
-
-
-            if test -z "$current_pid" || ! kill -0 "$current_pid" 2>/dev/null; then
-
-
-              hdiutil detach "$mount" >"$report/detach.txt" 2>&1 || true
-
-
-            else
-
-
-              printf 'OWNED_APP_STILL_ALIVE; no forced termination or detach\n' > "$report/cleanup-warning.txt"
-
-
+            local status=$?
+            trap - EXIT
+            if test "$status" -ne 0; then
+              printf 'PHASE=%s\nEXIT=%s\n' "$test_phase" "$status" > "$report/failure-phase.txt"
+              screencapture -x "$report/failure-screen.png" >"$report/failure-capture.txt" 2>&1 || true
+              if test -n "$current_pid"; then ps -p "$current_pid" -o pid,ppid,stat,comm >"$report/failure-process.txt" 2>&1 || true; fi
             fi
-
-
+            if test -z "$current_pid" || ! kill -0 "$current_pid" 2>/dev/null; then
+              hdiutil detach "$mount" >"$report/detach.txt" 2>&1 || true
+            else
+              printf 'OWNED_APP_STILL_ALIVE; no forced termination or detach\n' > "$report/cleanup-warning.txt"
+            fi
+            return "$status"
           }
-
-
           trap cleanup EXIT
+          cat > "$work/gui-driver.applescript" <<'ASDRIVER'
+          on run argv
+            set operation to item 1 of argv
+            set wantedBundle to item 2 of argv
+            set expectedPID to (item 3 of argv) as integer
+            with timeout of 10 seconds
+              tell application "System Events"
+                if expectedPID > 0 then
+                  set matches to every application process whose unix id is expectedPID
+                else
+                  set matches to every application process whose bundle identifier is wantedBundle
+                end if
+                if (count of matches) is 0 then
+                  if operation is "query" then return "0|0"
+                  error "OWNED_PROCESS_MISSING_BEFORE_GUI_ACTION"
+                end if
+                set ownedProcess to item 1 of matches
+                if (bundle identifier of ownedProcess) is not wantedBundle then error "OWNED_PROCESS_IDENTITY_DIFFERS"
+                set actualPID to unix id of ownedProcess
+                if operation is "query" then
+                  tell ownedProcess
+                    set windowCount to count of windows
+                  end tell
+                  return (actualPID as text) & "|" & (windowCount as text)
+                else if operation is "activate" then
+                  tell ownedProcess to set frontmost to true
+                  return "ACTIVATED"
+                else if operation is "title" then
+                  tell ownedProcess
+                    if (count of windows) is 0 then return ""
+                    return name of front window
+                  end tell
+                else if operation is "quit" then
+                  tell ownedProcess
+                    set frontmost to true
+                    delay 0.2
+                    keystroke "q" using command down
+                  end tell
+                  return "QUIT_REQUESTED"
+                else
+                  error "UNKNOWN_GUI_DRIVER_OPERATION"
+                end if
+              end tell
+            end timeout
+          end run
+          ASDRIVER
+          osacompile -o "$work/gui-driver.scpt" "$work/gui-driver.applescript"
+          gui() { osascript "$work/gui-driver.scpt" "$1" "$2" "${3:-0}"; }
+
 
 
           if ! curl --fail --location --silent --proto '=https' --tlsv1.2 "$AIWS_ARM_APP_URL" -o "$work/input/app.zip" 2>/dev/null; then
@@ -144,6 +186,35 @@ jobs:
 
 
           printf 'EXACT_CURRENT_STUDIO_BINARY_VERIFIED; not launched and no qualification issued\n' > "$report/studio-scope.txt"
+          test_phase="central-gui-driver-preflight"
+          printf 'AIWS central GUI driver preflight - no product or credentials\n' > "$work/gui-driver-probe.txt"
+          open -a TextEdit "$work/gui-driver-probe.txt"
+          windows=0
+          for ((attempt=1; attempt<=10; attempt++)); do
+            observed="$(gui query com.apple.TextEdit 0)"
+            candidate_pid="${observed%%|*}"
+            windows="${observed##*|}"
+            [[ "$candidate_pid" =~ ^[0-9]+$ && "$windows" =~ ^[0-9]+$ ]]
+            if test "$candidate_pid" -gt 0; then current_pid="$candidate_pid"; else current_pid=""; fi
+            if test -n "$current_pid" && test "$windows" -gt 0; then break; fi
+            sleep 1
+          done
+          test -n "$current_pid" && test "$windows" -gt 0
+          gui activate com.apple.TextEdit "$current_pid"
+          gui title com.apple.TextEdit "$current_pid" > "$report/driver-preflight-title.txt"
+          grep -Fq 'gui-driver-probe.txt' "$report/driver-preflight-title.txt"
+          screencapture -x "$report/driver-preflight-gui.png"
+          test -s "$report/driver-preflight-gui.png"
+          gui quit com.apple.TextEdit "$current_pid"
+          for ((attempt=1; attempt<=30; attempt++)); do
+            if ! kill -0 "$current_pid" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if kill -0 "$current_pid" 2>/dev/null; then printf 'DRIVER_PREFLIGHT_NORMAL_QUIT_FAILED\n' > "$report/driver-preflight-result.txt"; exit 1; fi
+          printf 'SAME_CENTRAL_DRIVER_QUERY_ACTIVATE_TITLE_QUIT=PASS\n' > "$report/driver-preflight-result.txt"
+          current_pid=""
+          test_phase="latest-public-and-private-image-inputs"
+
 
 
           if ! curl --fail --location --silent --proto '=https' --tlsv1.2 'https://download.deepseek.com/dsh-desk/feeds/mac-arm64/nightly-mac.yml' -o "$report/deepseek-official-feed.yml" 2>/dev/null; then
@@ -221,6 +292,7 @@ jobs:
 
 
           while IFS=$'\t' read -r label app bundle_id entry; do
+            test_phase="component-$label/identity-and-launch"
 
 
             lipo "$entry" -verify_arch arm64
@@ -247,16 +319,18 @@ jobs:
             for ((attempt=1; attempt<=90; attempt++)); do
 
 
-              observed="$(osascript -e 'with timeout of 10 seconds' -e "tell application \"System Events\" to if exists (first process whose bundle identifier is \"$bundle_id\") then return (unix id of first process whose bundle identifier is \"$bundle_id\") as string & \"|\" & (count windows of first process whose bundle identifier is \"$bundle_id\")" -e 'end timeout')"
+              observed="$(gui query "$bundle_id" 0)"
 
 
               if test -n "$observed"; then
 
 
-                current_pid="${observed%%|*}"
+                candidate_pid="${observed%%|*}"
 
 
                 windows="${observed##*|}"
+                [[ "$candidate_pid" =~ ^[0-9]+$ && "$windows" =~ ^[0-9]+$ ]]
+                if test "$candidate_pid" -gt 0; then current_pid="$candidate_pid"; else current_pid=""; fi
 
 
                 if test "$windows" -gt 0; then break; fi
@@ -277,7 +351,8 @@ jobs:
             printf 'PID=%s\nWINDOWS=%s\n' "$current_pid" "$windows" > "$report/$label-window.txt"
 
 
-            osascript -e 'with timeout of 10 seconds' -e "tell application \"System Events\" to set frontmost of first process whose unix id is $current_pid to true" -e 'end timeout'
+            test_phase="component-$label/activate"
+            gui activate "$bundle_id" "$current_pid"
 
 
             sample "$current_pid" 1 1 -file "$report/$label-process-sample.txt" >/dev/null 2>&1
@@ -288,7 +363,7 @@ jobs:
             if grep -Eiq '^[[:space:]]*Code Type:.*(X86|Translated)' "$report/$label-process-sample.txt"; then exit 1; fi
 
 
-            osascript -e 'with timeout of 10 seconds' -e "tell application \"System Events\" to get name of front window of first process whose unix id is $current_pid" -e 'end timeout' > "$report/$label-window-title.txt"
+            gui title "$bundle_id" "$current_pid" > "$report/$label-window-title.txt"
 
 
             screencapture -x "$report/$label-gui.png"
@@ -297,7 +372,8 @@ jobs:
             test -s "$report/$label-gui.png"
 
 
-            osascript -e 'with timeout of 10 seconds' -e "tell application \"System Events\" to tell first process whose unix id is $current_pid to keystroke \"q\" using command down" -e 'end timeout'
+            test_phase="component-$label/quit"
+            gui quit "$bundle_id" "$current_pid"
 
 
             for ((attempt=1; attempt<=30; attempt++)); do
@@ -340,8 +416,6 @@ jobs:
 
 
           PYSUMMARY
-
-
       - name: Encrypt bounded private evidence
 
 
