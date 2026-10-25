@@ -1,0 +1,104 @@
+name: Recover one encrypted ARM diagnostic
+run-name: ARM diagnostic rewrap ${{ inputs.recovery_nonce }}
+on:
+  workflow_dispatch:
+    inputs:
+      recovery_nonce:
+        required: true
+        type: string
+      source_zip_sha256:
+        required: true
+        type: string
+      source_cipher_sha256:
+        required: true
+        type: string
+permissions:
+  actions: read
+  contents: read
+jobs:
+  rewrap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Fetch only the pinned encrypted diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECOVERY_NONCE: ${{ inputs.recovery_nonce }}
+          ZIP_SHA: ${{ inputs.source_zip_sha256 }}
+          CIPHER_SHA: ${{ inputs.source_cipher_sha256 }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, io, os, pathlib, re, stat, urllib.request, urllib.error, urllib.parse, zipfile
+          os.umask(0o077)
+          assert re.fullmatch(r'[0-9a-f]{32}', os.environ['RECOVERY_NONCE'])
+          assert all(re.fullmatch(r'[0-9a-f]{64}', os.environ[x]) for x in ('ZIP_SHA','CIPHER_SHA'))
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'aiws-diagnostic-rewrap'
+          root.mkdir(exist_ok=False)
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,*args,**kwargs): return None
+          req=urllib.request.Request('https://api.github.com/repos/zhangruimg9-ctrl/aiws-arm-gui-probe-20261025/actions/artifacts/12590379179/zip',headers={'Authorization':'Bearer '+os.environ.pop('GH_TOKEN'),'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'})
+          try:
+              response=urllib.request.build_opener(NoRedirect()).open(req,timeout=30)
+              response.close(); raise RuntimeError('Expected archive redirect')
+          except urllib.error.HTTPError as error:
+              assert error.code==302
+              url=error.headers['Location']; error.close()
+          host=urllib.parse.urlsplit(url)
+          assert host.scheme=='https' and re.fullmatch(r'productionresults[a-z0-9-]*\.blob\.core\.windows\.net',host.hostname or '')
+          with urllib.request.urlopen(url,timeout=30) as response: body=response.read(262145)
+          assert len(body)<=262144 and hashlib.sha256(body).hexdigest()==os.environ['ZIP_SHA']
+          with zipfile.ZipFile(io.BytesIO(body)) as archive:
+              rows=archive.infolist()
+              assert len(rows)==1 and rows[0].filename=='report.gpg' and rows[0].file_size<=262144
+              assert not rows[0].flag_bits&1 and stat.S_IFMT(rows[0].external_attr>>16) in (0,stat.S_IFREG)
+              cipher=archive.read(rows[0])
+          assert hashlib.sha256(cipher).hexdigest()==os.environ['CIPHER_SHA']
+          (root/'source.gpg').write_bytes(cipher)
+          PY
+      - name: Authenticate original ciphertext and reencrypt in one private step
+        env:
+          SOURCE_REPORT_KEY: ${{ secrets.AIWS_ARM_PROD_REPORT_KEY }}
+          NEW_REPORT_KEY: ${{ secrets.AIWS_ARM_REWRAP_REPORT_KEY }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,pathlib,shutil,subprocess
+          os.umask(0o077)
+          old=os.environ.pop('SOURCE_REPORT_KEY'); new=os.environ.pop('NEW_REPORT_KEY')
+          assert len(old)>=40 and len(new)>=40
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'aiws-diagnostic-rewrap'
+          home=root/'gpg-home'; home.mkdir(mode=0o700)
+          plain=root/'authenticated.tar.gz'; output=root/'report.gpg'
+          common=['gpg','--batch','--yes','--quiet','--pinentry-mode','loopback','--no-symkey-cache','--homedir',str(home),'--passphrase-fd','0']
+          try:
+              r=subprocess.run(common+['--output',str(plain),'--decrypt',str(root/'source.gpg')],input=(old+'\n').encode(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=45)
+              old=None
+              assert r.returncode==0 and plain.is_file() and plain.stat().st_size<=2097152
+              r=subprocess.run(common+['--cipher-algo','AES256','--force-mdc','--compress-algo','none','--output',str(output),'--symmetric',str(plain)],input=(new+'\n').encode(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=45)
+              new=None
+              assert r.returncode==0 and output.is_file() and output.stat().st_size<=262144
+          finally:
+              old=new=None
+              for path in (plain,root/'source.gpg'):
+                  if path.exists():path.unlink()
+              subprocess.run(['gpgconf','--homedir',str(home),'--kill','gpg-agent'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=15)
+              shutil.rmtree(home)
+          PY
+      - name: Return ciphertext only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: private-arm-diagnostic-rewrapped-40172814147
+          path: ${{ runner.temp }}/aiws-diagnostic-rewrap/report.gpg
+          if-no-files-found: error
+          retention-days: 1
+      - name: Remove owned runner temporary files
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,pathlib,shutil
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'aiws-diagnostic-rewrap'
+          assert root.parent==pathlib.Path(os.environ['RUNNER_TEMP']) and root.name=='aiws-diagnostic-rewrap'
+          if root.exists():shutil.rmtree(root)
+          PY
