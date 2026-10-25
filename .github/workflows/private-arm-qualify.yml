@@ -1,0 +1,422 @@
+name: Private ARM native production candidate
+run-name: ARM production ${{ inputs.controller_nonce }}
+'on':
+  workflow_dispatch:
+    inputs:
+      controller_nonce:
+        required: true
+        type: string
+      plan_sha256:
+        required: true
+        type: string
+      packet_sha256:
+        required: true
+        type: string
+      packet_bytes:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  qualify:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CONTROLLER_NONCE: ${{ inputs.controller_nonce }}
+      PLAN_SHA256: ${{ inputs.plan_sha256 }}
+      PACKET_SHA256: ${{ inputs.packet_sha256 }}
+      PACKET_BYTES: ${{ inputs.packet_bytes }}
+      EXPECTED_REPOSITORY: zhangruimg9-ctrl/aiws-arm-gui-probe-20261025
+    steps:
+    - name: Prepare generic isolated driver
+      shell: bash
+      run: |
+        set -eu
+        umask 077
+        work="${RUNNER_TEMP}/aiws-arm-production-${GITHUB_RUN_ID}"
+        mkdir -m 700 "$work"
+        cat > "$work/workflow_driver.py" <<'PY'
+        import base64, hashlib, http.client, io, json, os, pathlib, plistlib, re, shutil, signal, stat, subprocess, sys, tarfile, threading, time, urllib.parse, urllib.request, zipfile
+        root = pathlib.Path(os.environ['RUNNER_TEMP']) / ('aiws-arm-production-' + os.environ['GITHUB_RUN_ID'])
+        root.mkdir(mode=0o700, exist_ok=True)
+        image=root/'old-input/arm64.dmg'
+        app=root/'app'/'AI工作站.app'
+        studio=app/'Contents/MacOS/AIWSStudio'
+        report = root / 'report'; report.mkdir(exist_ok=True)
+        log = (report / 'workflow.log').open('ab', buffering=0)
+        sys.stdout = io.TextIOWrapper(log, encoding='utf-8', write_through=True)
+        sys.stderr = sys.stdout
+        run_id = os.environ['GITHUB_RUN_ID']; repo = os.environ['GITHUB_REPOSITORY']
+        result_path=root/'result.json'
+        if result_path.is_file():
+            result=json.loads(result_path.read_bytes())
+        else:
+            result = {'schema':'aiws.arm.production-result.v1', 'runId':run_id,
+                      'controllerNonce':os.environ['CONTROLLER_NONCE'], 'planSha256':os.environ['PLAN_SHA256'],
+                      'status':'FAILED', 'phase':'preflight',
+                      'scope':'Current ARM image and actual normal native startup/binding qualification only; backend readiness, model dialogue, buyer GUI/Chinese persistence and physical USB are not proven.'}
+        def write(path, value):
+            path.write_text(json.dumps(value, ensure_ascii=True, indent=2) + '\n', encoding='utf-8')
+        def phase(name):
+            result['phase'] = name
+            write(root / 'result.json', result)
+            print(json.dumps({'phase':name, 'utc':time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}), flush=True)
+        def require(value, text):
+            if not value: raise ValueError(text)
+        def sha(path):
+            h=hashlib.sha256()
+            with path.open('rb') as f:
+                for block in iter(lambda:f.read(1024*1024), b''): h.update(block)
+            return h.hexdigest()
+        def command(argv, timeout=60, dest=None):
+            with (dest or report / 'tools.log').open('ab') as output:
+                p = subprocess.Popen(argv, stdout=output, stderr=subprocess.STDOUT, start_new_session=True, env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','USER','LOGNAME','SHELL','TMPDIR','TMP','TEMP','LANG','LC_ALL','DEVELOPER_DIR','SDKROOT','__CF_USER_TEXT_ENCODING','COMMAND_MODE','XPC_SERVICE_NAME')})
+                try: code=p.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    os.killpg(p.pid, signal.SIGTERM)
+                    try: p.wait(timeout=15)
+                    except subprocess.TimeoutExpired: pass
+                    raise TimeoutError('Owned command exceeded its original cap') from None
+            require(code == 0, 'Command failed: '+pathlib.Path(argv[0]).name+' exit '+str(code))
+        def fetch(secret_name, target, size, digest):
+            url=os.environ.get(secret_name,'')
+            parsed=urllib.parse.urlsplit(url)
+            require(parsed.scheme == 'https' and parsed.hostname in ('release-assets.githubusercontent.com','objects.githubusercontent.com'), 'Unexpected private download host')
+            h=hashlib.sha256(); count=0
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent':'AIWS-private-production/1'}), timeout=120) as src, target.open('xb') as dst:
+                    require(urllib.parse.urlsplit(src.url).hostname in ('release-assets.githubusercontent.com','objects.githubusercontent.com'), 'Unexpected download redirect')
+                    while True:
+                        block=src.read(1024*1024)
+                        if not block: break
+                        count+=len(block); require(count <= size, 'Input exceeds authorized bytes')
+                        h.update(block); dst.write(block)
+            except Exception as exc:
+                raise RuntimeError('Private input fetch failed ('+type(exc).__name__+')') from None
+            require(count == size and h.hexdigest() == digest, 'Private input pin mismatch')
+        def extract_zip(archive, destination, max_entries, max_bytes):
+            destination.mkdir()
+            with zipfile.ZipFile(archive) as z:
+                entries=z.infolist(); require(len(entries)<=max_entries, 'Archive member cap')
+                seen=set(); total=0
+                for item in entries:
+                    name=item.filename; path=pathlib.PurePosixPath(name)
+                    require(name and not path.is_absolute() and '..' not in path.parts and '\\' not in name and name not in seen and not (item.flag_bits & 1), 'Unsafe archive member')
+                    seen.add(name); mode=item.external_attr >> 16
+                    require(not stat.S_ISLNK(mode) and (stat.S_IFMT(mode) in (0,stat.S_IFREG,stat.S_IFDIR)), 'Nonregular archive member')
+                    total+=item.file_size; require(total<=max_bytes, 'Archive expanded size cap')
+                    target=destination.joinpath(*path.parts)
+                    if item.is_dir(): target.mkdir(parents=True, exist_ok=True); continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with z.open(item) as src, target.open('xb') as dst: shutil.copyfileobj(src,dst,1024*1024)
+                    if mode & 0o111: target.chmod(0o755)
+            return seen
+        def capture_diagnostic():
+            # Only on-screen window owner identity and AX window/button names/roles.
+            # No field values, credential material, guessed dialog actions or permissions changes.
+            try:
+                command(['/usr/sbin/screencapture','-x',str(report/'failure-screen.png')],timeout=15)
+            except Exception: pass
+            script = r"""ObjC.import('Cocoa'); ObjC.import('CoreGraphics');
+        const a=ObjC.deepUnwrap($.CGWindowListCopyWindowInfo(1,0)) || [];
+        JSON.stringify(a.slice(0,40).map(w=>{
+          const p=Number(w.kCGWindowOwnerPID||0); const app=$.NSRunningApplication.runningApplicationWithProcessIdentifier(p);
+          let bid=''; try {bid=ObjC.unwrap(app.bundleIdentifier)||'';} catch(e){}
+          return {pid:p,owner:String(w.kCGWindowOwnerName||'').slice(0,120),bundleIdentifier:bid,title:String(w.kCGWindowName||'').slice(0,240),layer:w.kCGWindowLayer};
+        }));"""
+            try:
+                p=subprocess.run(['/usr/bin/osascript','-l','JavaScript','-e',script],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=20)
+                if p.returncode == 0 and len(p.stdout)<=64000:
+                    rows=json.loads(p.stdout); write(report/'onscreen-windows.json',rows)
+                    ids=list(dict.fromkeys(x['pid'] for x in rows if x.get('pid',0)>0))[:12]
+                    for pid in ids:
+                        ax='on run argv\nset selectedPID to (item 1 of argv) as integer\nset records to {}\ntell application "System Events"\nset ownedProcess to first application process whose unix id is selectedPID\ntell ownedProcess\nset selectedWindows to windows\nrepeat with windowIndex from 1 to (count selectedWindows)\nif windowIndex > 6 then exit repeat\nset selectedWindow to item windowIndex of selectedWindows\ntry\nset end of records to ((role of selectedWindow) as text) & ":" & ((name of selectedWindow) as text)\nend try\nend repeat\nend tell\nend tell\nset AppleScript\'s text item delimiters to linefeed\nreturn records as text\nend run'
+                        try:
+                            q=subprocess.run(['/usr/bin/osascript','-e',ax,str(pid)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=8)
+                            if q.returncode==0: (report/('ax-'+str(pid)+'.txt')).write_bytes(q.stdout[:8000])
+                        except Exception: pass
+            except Exception: pass
+        def api(method,path,body=None):
+            payload=json.dumps(body).encode() if body is not None else None
+            req=urllib.request.Request('https://api.github.com'+path,data=payload,method=method,
+                headers={'Authorization':'Bearer '+os.environ['GH_JOB_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json','X-GitHub-Api-Version':'2022-11-28'})
+            try:
+                with urllib.request.urlopen(req,timeout=60) as response:
+                    data=response.read(1024*1024+1); require(len(data)<=1024*1024,'API response cap')
+                    return json.loads(data)
+            except Exception as exc: raise RuntimeError('Draft API failed ('+type(exc).__name__+')') from None
+        def upload(release_id,path):
+            connection=http.client.HTTPSConnection('uploads.github.com',timeout=180)
+            endpoint='/repos/'+repo+'/releases/'+str(release_id)+'/assets?name='+urllib.parse.quote(path.name)
+            try:
+                connection.putrequest('POST',endpoint)
+                connection.putheader('Authorization','Bearer '+os.environ['GH_JOB_TOKEN'])
+                connection.putheader('Accept','application/vnd.github+json')
+                connection.putheader('Content-Type','application/octet-stream')
+                connection.putheader('Content-Length',str(path.stat().st_size)); connection.endheaders()
+                with path.open('rb') as src:
+                    for block in iter(lambda:src.read(1024*1024),b''): connection.send(block)
+                response=connection.getresponse(); data=response.read(1024*1024+1)
+                require(response.status==201 and len(data)<=1024*1024, 'Encrypted chunk upload failed')
+                asset=json.loads(data)
+                require(asset.get('name')==path.name and asset.get('size')==path.stat().st_size,'Uploaded asset identity mismatch')
+                return asset
+            except Exception as exc: raise RuntimeError('Encrypted chunk transfer failed ('+type(exc).__name__+')') from None
+            finally: connection.close()
+        def encrypted_chunks(base,relative_names):
+            chunks_dir=root/'cipher-chunks'; chunks_dir.mkdir()
+            home=root/'gnupg'; home.mkdir(mode=0o700)
+            read_fd,write_fd=os.pipe(); os.write(write_fd,os.environ['AIWS_ARM_PROD_REPORT_KEY'].encode()+b'\n'); os.close(write_fd)
+            err=(report/'gpg-output.log').open('wb')
+            proc=subprocess.Popen(['gpg','--batch','--yes','--no-tty','--homedir',str(home),'--pinentry-mode','loopback','--passphrase-fd',str(read_fd),'--symmetric','--cipher-algo','AES256','--force-mdc','--compress-algo','none','--output','-'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=err,pass_fds=(read_fd,))
+            os.close(read_fd); chunks=[]; whole=hashlib.sha256(); failures=[]; files=[]
+            def consume():
+                index=0; total=0; target=None
+                try:
+                    while True:
+                        data=proc.stdout.read(1024*1024)
+                        if not data: break
+                        whole.update(data); total+=len(data)
+                        if total > 3*1024**3+64*1024**2: raise ValueError('Encrypted output cap')
+                        while data:
+                            if target is None:
+                                name='arm-qualified.tar.gz.gpg.part-'+format(index,'04d')
+                                path=chunks_dir/name; target=path.open('xb'); item={'index':index,'name':name,'bytes':0}; h=hashlib.sha256()
+                            take=min(len(data),1024**3-1-item['bytes']); piece=data[:take]; data=data[take:]
+                            target.write(piece); h.update(piece); item['bytes']+=take
+                            if item['bytes']==1024**3-1:
+                                target.close(); target=None; item['sha256']=h.hexdigest(); chunks.append(item); index+=1
+                    if target is not None:
+                        target.close(); target=None; item['sha256']=h.hexdigest(); chunks.append(item)
+                except Exception as exc:
+                    failures.append(type(exc).__name__)
+                    if target is not None: target.close()
+                    proc.terminate()
+            consumer=threading.Thread(target=consume); consumer.start()
+            try:
+                class HashReader:
+                    def __init__(self,stream,h): self.stream=stream; self.h=h
+                    def read(self,n=-1):
+                        block=self.stream.read(n); self.h.update(block); return block
+                with tarfile.open(fileobj=proc.stdin,mode='w|gz') as tar:
+                    for relative in relative_names:
+                        path=base/relative; info=path.lstat(); require(stat.S_ISREG(info.st_mode), 'Output must be a regular file')
+                        digest=hashlib.sha256(); item=tarfile.TarInfo(relative); item.size=info.st_size; item.mode=0o644; item.mtime=0
+                        with path.open('rb') as src: tar.addfile(item,HashReader(src,digest))
+                        files.append({'path':relative,'bytes':info.st_size,'sha256':digest.hexdigest()})
+                proc.stdin.close(); code=proc.wait(timeout=180); consumer.join(timeout=180)
+                require(not consumer.is_alive() and not failures and code==0 and chunks, 'GPG stream failed')
+                return {'name':'arm-qualified.tar.gz.gpg','bytes':sum(x['bytes'] for x in chunks),'sha256':whole.hexdigest()},chunks,files
+            finally:
+                if proc.poll() is None: proc.terminate()
+                err.close()
+        mode=sys.argv[1]
+        try:
+            if mode=='prepare':
+                require(repo==os.environ['EXPECTED_REPOSITORY'],'Wrong repository')
+                require(re.fullmatch(r'[A-Za-z0-9_-]{16,100}',result['controllerNonce']) is not None,'Invalid controller nonce')
+                require(re.fullmatch(r'[a-f0-9]{64}',result['planSha256']) is not None,'Invalid plan hash')
+                require(re.fullmatch(r'[a-f0-9]{64}',os.environ['PACKET_SHA256']) is not None,'Invalid packet hash')
+                packet_bytes=int(os.environ['PACKET_BYTES']); require(0<packet_bytes<24*1024**2,'Invalid packet bound')
+                require(sys.platform=='darwin' and os.uname().machine=='arm64','Matching native ARM runner required')
+                require(shutil.which('gpg') is not None,'Encryption prerequisite missing')
+                (root/'input-downloads').mkdir(); (root/'old-input').mkdir()
+                phase('small-private-input-pins')
+                packet=root/'input-downloads'/'packet.zip'; fetch('AIWS_ARM_PROD_PACKET_URL',packet,packet_bytes,os.environ['PACKET_SHA256'])
+                names=extract_zip(packet,root/'input',1200,18*1024**2)
+                manifest=json.loads((root/'input/packet-manifest.json').read_bytes())
+                require(manifest.get('schema')==1 and manifest.get('siteFiles')==1132 and manifest.get('siteBytes')==14727097,'Packet site identity mismatch')
+                expected={x['path']:x for x in manifest['files']}
+                require(len(expected)==len(manifest['files']) and names==set(expected)|{'packet-manifest.json'},'Packet inventory mismatch')
+                for name,item in expected.items():
+                    path=root/'input'/name; require(path.stat().st_size==item['bytes'] and sha(path)==item['sha256'],'Packet file mismatch')
+                require(sha(root/'input/producer/qualify_native_payload.py')=='04990710bf0179c0c1d67787b9cae155056711542dba20f63942b4547bcc321a','Producer source mismatch')
+                require(sha(root/'input/producer/vendor-inputs.json')=='15b3ae70fae131db14778a487fc20c06f73388578b0ea406a83b3e32036c11c1','Vendor pins mismatch')
+                require(sha(root/'input/source-manifest.json')==manifest['sourceManifestSHA256']=='f2de4bd58085fab7f790c6fe7aed1fb2ac837f682f6405b4faba2a4f26069740','Source manifest mismatch')
+                source=json.loads((root/'input/source-manifest.json').read_bytes()); prefix=manifest['sourceManifestSitePrefix']
+                source_rows={x['path'][len(prefix):]:x for x in source['files'] if x['path'].startswith(prefix)}
+                site_rows={x[5:]:v for x,v in expected.items() if x.startswith('site/')}
+                require(set(source_rows)==set(site_rows) and len(site_rows)==1132,'Full site source association mismatch')
+                require(sum(x['bytes'] for x in site_rows.values())==14727097,'Site bytes mismatch')
+                for name,item in site_rows.items():
+                    require(source_rows[name]['size']==item['bytes'] and source_rows[name]['sha256']==item['sha256'],'Site source bytes mismatch')
+                app_zip=root/'input-downloads'/'app.zip'; fetch('AIWS_ARM_PROD_APP_URL',app_zip,566824,'f3790a78052adfce29621ae16ef96dafef870f8a952dfb09d8945bddfff89b57')
+                app_names=extract_zip(app_zip,root/'app',12,4*1024**2)
+                app=root/'app'/'AI工作站.app'; studio=app/'Contents/MacOS/AIWSStudio'
+                require(len([p for p in (root/'app').rglob('*') if p.is_file()])==6 and studio.stat().st_size==1643264 and sha(studio)=='fdc8fe910b6b58ecbcd2bea6de4f530f3799ad83f35dc88f949fdfcd5680b724','Current app identity mismatch')
+                command(['/usr/bin/lipo',str(studio),'-verify_arch','arm64','x86_64'])
+                command(['/usr/bin/codesign','--verify','--deep','--strict',str(app)])
+                phase('fresh-official-arm-feed')
+                pins=json.loads((root/'input/producer/vendor-inputs.json').read_bytes()); pin=next(x for x in pins['assets'] if x['id']=='deepseek-arm64')
+                require(pin['version']=='0.2.1-rc.3' and pin['sha256']=='599a3ceef4d58f2b82bfd61ca4ef9d55c0f8e055dde60550c92f00d78d0cad2f','Current DSH pin mismatch')
+                require(pin['feed']=='https://download.deepseek.com/dsh-desk/feeds/mac-arm64/nightly-mac.yml','Unexpected official feed')
+                with urllib.request.urlopen(pin['feed'],timeout=30) as response:
+                    require(urllib.parse.urlsplit(response.url).hostname=='download.deepseek.com','Unexpected official feed redirect')
+                    feed=response.read(32769)
+                require(len(feed)<=32768 and hashlib.sha256(feed).hexdigest()==pin['feed_sha256'],'Official feed changed or unknown; do not build stale input')
+                text=feed.decode('utf-8'); require('version: '+pin['version'] in text and pin['filename'] in text and pin['sha512_base64'] in text,'Fresh feed input identity mismatch')
+                write(report/'input-review.json',{'packetSHA256':os.environ['PACKET_SHA256'],'packetBytes':packet_bytes,'siteFiles':1132,'siteBytes':14727097,'sourceManifestSHA256':manifest['sourceManifestSHA256'],'actualLauncherSHA256':sha(studio),'officialFeedSHA256':pin['feed_sha256'],'officialVersion':pin['version'],'checkedUTC':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())})
+                phase('verified-immutable-hermes-image-download')
+                image=root/'old-input/arm64.dmg'; fetch('AIWS_ARM_PROD_IMAGE_URL',image,1958354872,'36b5489eefdb498929632674571c856b12300ad732581497f9d7b5b5133153fd')
+                write(report/'space-before-producer.json',{'freeBytes':shutil.disk_usage(root).free,'scope':'Existing normal producer owns conservative peak-space admission; no threshold override.'})
+            elif mode=='qualify':
+                phase('normal-producer-once')
+                started=time.monotonic()
+                command([sys.executable,str(root/'input/producer/qualify_native_payload.py'),'--arch','arm64','--inputs',str(root/'input/producer/vendor-inputs.json'),'--hermes-arm64-image',str(image),'--cache',str(root/'vendor-cache'),'--output',str(root/'qualified-current'),'--shared-site',str(root/'input/site'),'--launcher',str(app),'--confirm-fresh-test-quit'],timeout=2700,dest=report/'producer.log')
+                result['producerSeconds']=round(time.monotonic()-started,3)
+                base=root/'qualified-current'
+                relative_names=['Mac/payloads/arm64.dmg','Mac/qualification.json','Mac/evidence/arm64.json','Mac/evidence/arm64-native.json','image-build.json']
+                total=0
+                for name in relative_names:
+                    p=base/name; require(p.is_file() and not p.is_symlink(),'Missing normal producer output'); total+=p.stat().st_size
+                require(total<=3*1024**3,'Plain product output cap')
+                native=json.loads((base/'Mac/evidence/arm64-native.json').read_bytes())
+                built=json.loads((base/'image-build.json').read_bytes())
+                qual=json.loads((base/'Mac/qualification.json').read_bytes())
+                receipt=json.loads((base/'Mac/evidence/arm64.json').read_bytes())
+                require(native.get('status')=='NATIVE_START_AND_BINDING_SMOKE_PASS' and native.get('hostExecutableSHA256')==sha(studio),'Actual normal native evidence mismatch')
+                require({x['id'] for x in native['agents']}=={'hermes','deepseek'},'Native component evidence incomplete')
+                require(built.get('architecture')=='arm64' and built.get('status')=='BUILT_NOT_NATIVE_QUALIFIED','Normal image build receipt mismatch')
+                require(len(qual['payloads'])==1 and qual['payloads'][0]['architecture']=='arm64' and qual['payloads'][0]['sha256']==built['artifact']['sha256']==receipt['artifact']['sha256'],'Normal output binding mismatch')
+                result['nativeQualificationComplete']=True
+                phase('normal-native-probe-complete')
+            elif mode=='encrypt-output':
+                require(result.get('nativeQualificationComplete') is True,'Normal producer has no qualified output')
+                base=root/'qualified-current'
+                relative_names=['Mac/payloads/arm64.dmg','Mac/qualification.json','Mac/evidence/arm64.json','Mac/evidence/arm64-native.json','image-build.json']
+                built=json.loads((base/'image-build.json').read_bytes())
+                phase('encrypt-actual-normal-output')
+                cipher,chunks,files=encrypted_chunks(base,relative_names)
+                actual_image=next(x for x in files if x['path']=='Mac/payloads/arm64.dmg')
+                require(actual_image['bytes']==built['artifact']['bytes'] and actual_image['sha256']==built['artifact']['sha256'],'Final output image differs from normal receipt')
+                write(root/'output-manifest.json',{'schema':'aiws.arm.encrypted-output.v1','runId':run_id,'repository':repo,'cipher':cipher,'chunks':chunks,'files':files,'uploadedChunks':[]})
+                result['encryptedOutputReady']=True
+                phase('encrypted-output-ready')
+            elif mode=='upload-output':
+                require(result.get('encryptedOutputReady') is True,'No encrypted output is ready')
+                output=json.loads((root/'output-manifest.json').read_bytes())
+                cipher=output['cipher']; chunks=output['chunks']; files=output['files']
+                phase('create-run-owned-draft-and-upload-encrypted-chunks')
+                tag='aiws-arm-output-'+run_id
+                draft=api('POST','/repos/'+repo+'/releases',{'tag_name':tag,'target_commitish':os.environ['GITHUB_SHA'],'name':'AIWS encrypted ARM output '+run_id,'body':'controller_nonce='+result['controllerNonce']+'\nplan_sha256='+result['planSha256'],'draft':True,'prerelease':False})
+                require(draft.get('draft') is True and draft.get('tag_name')==tag,'Draft release identity mismatch')
+                output={'schema':'aiws.arm.encrypted-output.v1','runId':run_id,'repository':repo,'release':{'tag':tag,'id':draft['id'],'draft':True},'cipher':cipher,'chunks':chunks,'files':files,'uploadedChunks':[]}
+                write(root/'output-manifest.json',output)
+                for chunk in chunks:
+                    asset=upload(draft['id'],root/'cipher-chunks'/chunk['name'])
+                    if asset.get('digest'): require(asset['digest']=='sha256:'+chunk['sha256'],'GitHub chunk digest mismatch')
+                    output['uploadedChunks'].append(chunk['name']); write(root/'output-manifest.json',output)
+                result['status']='QUALIFIED'; result['outputManifest']='output-manifest.json'
+                phase('normal-native-candidate-returned-encrypted')
+            else:
+                raise ValueError('Unknown driver mode')
+        except Exception as exc:
+            result['errorType']=type(exc).__name__
+            result['errorMessage']=str(exc)[:600]
+            print('Controlled production failure; details remain private in encrypted report.',flush=True)
+            if mode=='qualify': capture_diagnostic()
+            write(root/'result.json',result)
+            raise SystemExit(1)
+        finally:
+            write(root/'result.json',result)
+            if not (root/'output-manifest.json').exists(): write(root/'output-manifest.json',{'schema':'aiws.arm.encrypted-output.v1','runId':run_id,'repository':repo,'status':'NO_COMPLETE_OUTPUT'})
+            sys.stdout.flush()
+
+        PY
+    - name: Fetch and verify authorized private inputs
+      shell: bash
+      env:
+        AIWS_ARM_PROD_IMAGE_URL: ${{ secrets.AIWS_ARM_PROD_IMAGE_URL }}
+        AIWS_ARM_PROD_APP_URL: ${{ secrets.AIWS_ARM_PROD_APP_URL }}
+        AIWS_ARM_PROD_PACKET_URL: ${{ secrets.AIWS_ARM_PROD_PACKET_URL }}
+      run: |
+        set -eu
+        umask 077
+        python3 "${RUNNER_TEMP}/aiws-arm-production-${GITHUB_RUN_ID}/workflow_driver.py" prepare
+    - name: Run normal producer once without secrets
+      shell: bash
+      run: |
+        set -eu
+        umask 077
+        python3 "${RUNNER_TEMP}/aiws-arm-production-${GITHUB_RUN_ID}/workflow_driver.py" qualify
+    - name: Encrypt actual candidate output
+      shell: bash
+      env:
+        AIWS_ARM_PROD_REPORT_KEY: ${{ secrets.AIWS_ARM_PROD_REPORT_KEY }}
+      run: |
+        set -eu
+        umask 077
+        python3 "${RUNNER_TEMP}/aiws-arm-production-${GITHUB_RUN_ID}/workflow_driver.py" encrypt-output
+    - name: Upload only ciphertext to run-owned draft
+      shell: bash
+      env:
+        GH_JOB_TOKEN: ${{ github.token }}
+      run: |
+        set -eu
+        umask 077
+        python3 "${RUNNER_TEMP}/aiws-arm-production-${GITHUB_RUN_ID}/workflow_driver.py" upload-output
+    - name: Encrypt bounded diagnostics even after failure
+      if: always()
+      shell: bash
+      env:
+        AIWS_ARM_PROD_REPORT_KEY: ${{ secrets.AIWS_ARM_PROD_REPORT_KEY }}
+      run: |
+        set -eu
+        umask 077
+        python3 - <<'PY'
+        import hashlib, io, json, os, pathlib, shutil, stat, subprocess, tarfile
+        root=pathlib.Path(os.environ['RUNNER_TEMP'])/('aiws-arm-production-'+os.environ['GITHUB_RUN_ID'])
+        if not root.is_dir() or not shutil.which('gpg') or len(os.environ.get('AIWS_ARM_PROD_REPORT_KEY',''))<32:
+            raise SystemExit('Encryption unavailable; no plaintext artifact is permitted.')
+        selected=[]; total=0
+        for name in ('result.json','output-manifest.json'):
+            p=root/name
+            if p.is_file() and not p.is_symlink(): selected.append((name,p))
+        report=root/'report'
+        if report.is_dir():
+            for p in sorted(report.iterdir()):
+                if len(selected)>=90: break
+                if p.is_file() and not p.is_symlink() and p.name.isascii() and p.suffix in ('.json','.txt','.log','.png'):
+                    selected.append(('report/'+p.name,p))
+        # Bound all private diagnostics. Large tool logs are represented by a tail.
+        normalized=[]
+        for name,p in selected:
+            size=p.stat().st_size
+            if name.startswith('report/') and size>4*1024**2:
+                if p.suffix in ('.log','.txt'):
+                    with p.open('rb') as f: f.seek(-1024*1024,2); tail=f.read(1024*1024)
+                    normalized.append((name,tail)); total+=len(tail)
+                continue
+            total+=size
+            if total>16*1024**2: break
+            normalized.append((name,p))
+        home=root/'report-gnupg'; home.mkdir(mode=0o700,exist_ok=True)
+        rd,wr=os.pipe(); os.write(wr,os.environ['AIWS_ARM_PROD_REPORT_KEY'].encode()+b'\n'); os.close(wr)
+        destination=root/'report.gpg'
+        with (root/'report-encryption.log').open('wb') as err:
+            p=subprocess.Popen(['gpg','--batch','--yes','--no-tty','--homedir',str(home),'--pinentry-mode','loopback','--passphrase-fd',str(rd),'--symmetric','--cipher-algo','AES256','--force-mdc','--compress-algo','none','--output',str(destination)],stdin=subprocess.PIPE,stderr=err,pass_fds=(rd,))
+            os.close(rd)
+            try:
+                with tarfile.open(fileobj=p.stdin,mode='w|gz') as tar:
+                    for name,source in normalized:
+                        size=len(source) if isinstance(source,bytes) else source.stat().st_size
+                        info=tarfile.TarInfo(name); info.size=size; info.mode=0o600; info.mtime=0
+                        if isinstance(source,bytes): tar.addfile(info,io.BytesIO(source))
+                        else:
+                            with source.open('rb') as f: tar.addfile(info,f)
+                p.stdin.close(); code=p.wait(timeout=90)
+                if code or not destination.is_file() or not 0<destination.stat().st_size<=20*1024**2: raise RuntimeError('Encrypted report failed')
+            except Exception:
+                if p.poll() is None: p.terminate()
+                destination.unlink(missing_ok=True)
+                raise SystemExit('Report encryption failed; plaintext upload prohibited.')
+        PY
+    - name: Return only encrypted diagnostics
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: private-arm-qualification-report-encrypted
+        path: ${{ runner.temp }}/aiws-arm-production-${{ github.run_id }}/report.gpg
+        if-no-files-found: error
+        retention-days: 1
+        compression-level: 0
