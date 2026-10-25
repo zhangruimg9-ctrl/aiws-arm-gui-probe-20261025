@@ -17,29 +17,30 @@ jobs:
           uname -m | tee "$report/architecture.txt"
           test "$(uname -m)" = arm64
           sw_vers > "$report/system-version.txt"
-          cleanup() {
-            osascript -e 'tell application "TextEdit" to quit saving no' >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-          osascript <<'APPLESCRIPT'
-          tell application "TextEdit"
-            activate
-            make new document with properties {text:"AIWS ARM GUI PROBE - no product or credentials"}
-          end tell
-          APPLESCRIPT
+          console_user="$(stat -f '%Su' /dev/console)"
+          printf 'CONSOLE_USER=%s\n' "$console_user" > "$report/gui-session.txt"
+          if launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
+            printf 'GUI_BOOTSTRAP=AVAILABLE\n' >> "$report/gui-session.txt"
+          else
+            printf 'GUI_BOOTSTRAP=UNAVAILABLE\n' >> "$report/gui-session.txt"
+          fi
+          screencapture -x "$report/screen-before.png" || true
+          printf 'AIWS ARM GUI PROBE - no product or credentials\n' > "$report/probe.txt"
+          open -a TextEdit "$report/probe.txt"
           window_count=0
           for attempt in 1 2 3 4 5 6 7 8 9 10; do
-            window_count="$(osascript -e 'tell application "System Events" to tell process "TextEdit" to count windows')"
+            window_count="$(osascript -e 'with timeout of 10 seconds' -e 'tell application "System Events" to tell process "TextEdit" to count windows' -e 'end timeout')"
             if test "$window_count" -gt 0; then break; fi
             sleep 1
           done
           test "$window_count" -gt 0
-          osascript -e 'tell application "TextEdit" to get text of front document' > "$report/gui-document.txt"
-          grep -Fxq 'AIWS ARM GUI PROBE - no product or credentials' "$report/gui-document.txt"
+          osascript -e 'with timeout of 10 seconds' -e 'tell application "System Events" to tell process "TextEdit" to get name of front window' -e 'end timeout' > "$report/gui-window.txt"
+          grep -Fq 'probe.txt' "$report/gui-window.txt"
           screencapture -x "$report/gui-screen.png"
           test -s "$report/gui-screen.png"
+          osascript -e 'with timeout of 10 seconds' -e 'tell application "System Events" to tell process "TextEdit" to click menu item "Quit TextEdit" of menu "TextEdit" of menu bar 1' -e 'end timeout'
           sips -g pixelWidth -g pixelHeight "$report/gui-screen.png" > "$report/screenshot-size.txt"
-          printf 'ARM64_NATIVE=PASS\nTEXTEDIT_DOCUMENT=PASS\nGUI_WINDOW_COUNT=%s\nSCREENSHOT_CREATED=PASS\n' "$window_count" | tee "$report/result.txt"
+          printf 'ARM64_NATIVE=PASS\nTEXTEDIT_WINDOW_TITLE=PASS\nGUI_WINDOW_COUNT=%s\nSCREENSHOT_CREATED=PASS\n' "$window_count" | tee "$report/result.txt"
       - name: Keep only probe evidence for one day
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
