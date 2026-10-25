@@ -1,0 +1,50 @@
+name: ARM macOS GUI environment probe
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - name: Check native architecture and real GUI
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/aiws-arm-gui-probe"
+          mkdir -p "$report"
+          uname -m | tee "$report/architecture.txt"
+          test "$(uname -m)" = arm64
+          sw_vers > "$report/system-version.txt"
+          cleanup() {
+            osascript -e 'tell application "TextEdit" to quit saving no' >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          osascript <<'APPLESCRIPT'
+          tell application "TextEdit"
+            activate
+            make new document with properties {text:"AIWS ARM GUI PROBE - no product or credentials"}
+          end tell
+          APPLESCRIPT
+          window_count=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            window_count="$(osascript -e 'tell application "System Events" to tell process "TextEdit" to count windows')"
+            if test "$window_count" -gt 0; then break; fi
+            sleep 1
+          done
+          test "$window_count" -gt 0
+          osascript -e 'tell application "TextEdit" to get text of front document' > "$report/gui-document.txt"
+          grep -Fxq 'AIWS ARM GUI PROBE - no product or credentials' "$report/gui-document.txt"
+          screencapture -x "$report/gui-screen.png"
+          test -s "$report/gui-screen.png"
+          sips -g pixelWidth -g pixelHeight "$report/gui-screen.png" > "$report/screenshot-size.txt"
+          printf 'ARM64_NATIVE=PASS\nTEXTEDIT_DOCUMENT=PASS\nGUI_WINDOW_COUNT=%s\nSCREENSHOT_CREATED=PASS\n' "$window_count" | tee "$report/result.txt"
+      - name: Keep only probe evidence for one day
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: arm-gui-probe
+          path: ${{ runner.temp }}/aiws-arm-gui-probe/
+          retention-days: 1
+          if-no-files-found: warn
