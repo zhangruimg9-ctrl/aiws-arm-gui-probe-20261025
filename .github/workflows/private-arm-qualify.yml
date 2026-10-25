@@ -230,7 +230,7 @@ jobs:
                 require(len(expected)==len(manifest['files']) and names==set(expected)|{'packet-manifest.json'},'Packet inventory mismatch')
                 for name,item in expected.items():
                     path=root/'input'/name; require(path.stat().st_size==item['bytes'] and sha(path)==item['sha256'],'Packet file mismatch')
-                require(sha(root/'input/producer/qualify_native_payload.py')=='04990710bf0179c0c1d67787b9cae155056711542dba20f63942b4547bcc321a','Producer source mismatch')
+                require(sha(root/'input/producer/qualify_native_payload.py')=='e7fd1c27df2fc087e092333b974b3b8bff2633eeb4c63ce9c0da4be58578c898','Producer source mismatch')
                 require(sha(root/'input/producer/vendor-inputs.json')=='15b3ae70fae131db14778a487fc20c06f73388578b0ea406a83b3e32036c11c1','Vendor pins mismatch')
                 require(sha(root/'input/source-manifest.json')==manifest['sourceManifestSHA256']=='f2de4bd58085fab7f790c6fe7aed1fb2ac837f682f6405b4faba2a4f26069740','Source manifest mismatch')
                 source=json.loads((root/'input/source-manifest.json').read_bytes()); prefix=manifest['sourceManifestSitePrefix']
