@@ -1,138 +1,422 @@
-name: Private ARM native component GUI test
-on:
-  workflow_dispatch: {}
-permissions:
-  contents: read
-jobs:
-  native-gui:
-    runs-on: macos-15
-    timeout-minutes: 15
-    steps:
-      - name: Test exact private native components
-        env:
-          AIWS_ARM_IMAGE_URL: ${{ secrets.AIWS_ARM_IMAGE_URL }}
-          AIWS_ARM_APP_URL: ${{ secrets.AIWS_ARM_APP_URL }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          work="$RUNNER_TEMP/aiws-private-native"
-          report="$work/report"
-          mkdir -p "$report" "$work/input" "$work/app" "$work/mount"
-          exec >"$report/native-test.log" 2>&1
-          test "$(uname -m)" = arm64
-          command -v gpg >/dev/null
-          sw_vers > "$report/system-version.txt"
-          uname -m > "$report/architecture.txt"
-          stat -f '%Su' /dev/console > "$report/console-user.txt"
-          mount="$work/mount"
-          current_pid=""
-          cleanup() {
-            if test -z "$current_pid" || ! kill -0 "$current_pid" 2>/dev/null; then
-              hdiutil detach "$mount" >"$report/detach.txt" 2>&1 || true
-            else
-              printf 'OWNED_APP_STILL_ALIVE; no forced termination or detach\n' > "$report/cleanup-warning.txt"
-            fi
-          }
-          trap cleanup EXIT
-          if ! curl --fail --location --silent --proto '=https' --tlsv1.2 "$AIWS_ARM_IMAGE_URL" -o "$work/input/arm64.dmg" 2>/dev/null; then
-            printf 'PRIVATE_IMAGE_FETCH_FAILED\n'; exit 1
-          fi
-          if ! curl --fail --location --silent --proto '=https' --tlsv1.2 "$AIWS_ARM_APP_URL" -o "$work/input/app.zip" 2>/dev/null; then
-            printf 'PRIVATE_APP_FETCH_FAILED\n'; exit 1
-          fi
-          unset AIWS_ARM_IMAGE_URL AIWS_ARM_APP_URL
-          test "$(stat -f '%z' "$work/input/arm64.dmg")" = 1958354872
-          printf '%s  %s\n' '36b5489eefdb498929632674571c856b12300ad732581497f9d7b5b5133153fd' "$work/input/arm64.dmg" | shasum -a 256 -c -
-          printf '%s  %s\n' 'f3790a78052adfce29621ae16ef96dafef870f8a952dfb09d8945bddfff89b57' "$work/input/app.zip" | shasum -a 256 -c -
-          ditto -x -k "$work/input/app.zip" "$work/app"
-          studio="$(find "$work/app" -name AIWSStudio -type f -print -quit)"
-          test -n "$studio"
-          test "$(stat -f '%z' "$studio")" = 1643264
-          printf '%s  %s\n' 'fdc8fe910b6b58ecbcd2bea6de4f530f3799ad83f35dc88f949fdfcd5680b724' "$studio" | shasum -a 256 -c -
-          lipo -verify_arch arm64 "$studio"
-          printf 'EXACT_CURRENT_STUDIO_BINARY_VERIFIED; not launched and no qualification issued\n' > "$report/studio-scope.txt"
-          hdiutil attach "$work/input/arm64.dmg" -readonly -nobrowse -mountpoint "$mount" > "$report/mount.txt"
-          python3 - "$mount" "$report" > "$work/components.tsv" <<'PYPLAN'
-          import json,pathlib,plistlib,re,sys
-          root=pathlib.Path(sys.argv[1]);report=pathlib.Path(sys.argv[2])
-          source=json.loads((root/'native-components.json').read_text())
-          rows=[]
-          for c in source['components']:
-              app=(root/c['bundle']).resolve()
-              if not app.is_relative_to(root.resolve()) or app.suffix!='.app':raise SystemExit('COMPONENT_PATH_REFUSED')
-              info=plistlib.loads((app/'Contents/Info.plist').read_bytes())
-              bid=info['CFBundleIdentifier'];exe=info['CFBundleExecutable'];label=re.sub('[^A-Za-z0-9_-]','_',str(c['id']))
-              if not re.fullmatch(r'[A-Za-z0-9_.-]+',bid) or not label:raise SystemExit('COMPONENT_ID_REFUSED')
-              entry=app/'Contents/MacOS'/exe
-              rows.append({'id':label,'bundle':str(app),'bundleIdentifier':bid,'entry':str(entry),'version':c.get('version')})
-          if len(rows)!=2 or len({r['bundleIdentifier'] for r in rows})!=2:raise SystemExit('EXPECTED_TWO_DISTINCT_COMPONENTS')
-          (report/'components.json').write_text(json.dumps(rows,indent=2))
-          for r in rows:print('\t'.join([r['id'],r['bundle'],r['bundleIdentifier'],r['entry']]))
-          PYPLAN
-          while IFS=$'\t' read -r label app bundle_id entry; do
-            lipo -verify_arch arm64 "$entry"
-            codesign --verify --deep --strict "$app" >"$report/$label-codesign.txt" 2>&1
-            userdata="$work/userdata/$label"
-            mkdir -p "$userdata"
-            open -n "$app" --args --user-data-dir="$userdata"
-            current_pid=""
-            windows=0
-            for attempt in $(seq 1 90); do
-              observed="$(osascript -e 'with timeout of 10 seconds' -e "tell application \"System Events\" to if exists (first process whose bundle identifier is \"$bundle_id\") then return (unix id of first process whose bundle identifier is \"$bundle_id\") as string & \"|\" & (count windows of first process whose bundle identifier is \"$bundle_id\")" -e 'end timeout')"
-              if test -n "$observed"; then
-                current_pid="${observed%%|*}"
-                windows="${observed##*|}"
-                if test "$windows" -gt 0; then break; fi
-              fi
-              sleep 2
-            done
-            test -n "$current_pid" && test "$windows" -gt 0
-            printf 'PID=%s\nWINDOWS=%s\n' "$current_pid" "$windows" > "$report/$label-window.txt"
-            osascript -e 'with timeout of 10 seconds' -e "tell application \"System Events\" to set frontmost of first process whose unix id is $current_pid to true" -e 'end timeout'
-            sample "$current_pid" 1 1 -file "$report/$label-process-sample.txt" >/dev/null 2>&1
+name: Private ARM native component GUI test
+
+
+on:
+
+
+  workflow_dispatch: {}
+
+
+permissions:
+
+
+  contents: read
+
+
+jobs:
+
+
+  native-gui:
+
+
+    runs-on: macos-15
+
+
+    timeout-minutes: 15
+
+
+    steps:
+
+
+      - name: Test exact private native components
+
+
+        env:
+
+
+          AIWS_ARM_IMAGE_URL: ${{ secrets.AIWS_ARM_IMAGE_URL }}
+
+
+          AIWS_ARM_APP_URL: ${{ secrets.AIWS_ARM_APP_URL }}
+
+
+        shell: bash
+
+
+        run: |
+
+
+          set -euo pipefail
+
+
+          work="$RUNNER_TEMP/aiws-private-native"
+
+
+          report="$work/report"
+
+
+          mkdir -p "$report" "$work/input" "$work/app" "$work/mount"
+
+
+          exec >"$report/native-test.log" 2>&1
+
+
+          test "$(uname -m)" = arm64
+
+
+          command -v gpg >/dev/null
+
+
+          sw_vers > "$report/system-version.txt"
+
+
+          uname -m > "$report/architecture.txt"
+
+
+          stat -f '%Su' /dev/console > "$report/console-user.txt"
+
+
+          mount="$work/mount"
+
+
+          current_pid=""
+
+
+          cleanup() {
+
+
+            if test -z "$current_pid" || ! kill -0 "$current_pid" 2>/dev/null; then
+
+
+              hdiutil detach "$mount" >"$report/detach.txt" 2>&1 || true
+
+
+            else
+
+
+              printf 'OWNED_APP_STILL_ALIVE; no forced termination or detach\n' > "$report/cleanup-warning.txt"
+
+
+            fi
+
+
+          }
+
+
+          trap cleanup EXIT
+
+
+          if ! curl --fail --location --silent --proto '=https' --tlsv1.2 "$AIWS_ARM_APP_URL" -o "$work/input/app.zip" 2>/dev/null; then
+
+
+            printf 'PRIVATE_APP_FETCH_FAILED\n'; exit 1
+
+
+          fi
+
+
+          unset AIWS_ARM_APP_URL
+
+
+
+
+
+
+          printf '%s  %s\n' 'f3790a78052adfce29621ae16ef96dafef870f8a952dfb09d8945bddfff89b57' "$work/input/app.zip" | shasum -a 256 -c -
+
+
+          ditto -x -k "$work/input/app.zip" "$work/app"
+
+
+          studio="$(find "$work/app" -name AIWSStudio -type f -print -quit)"
+
+
+          test -n "$studio"
+
+
+          test "$(stat -f '%z' "$studio")" = 1643264
+
+
+          printf '%s  %s\n' 'fdc8fe910b6b58ecbcd2bea6de4f530f3799ad83f35dc88f949fdfcd5680b724' "$studio" | shasum -a 256 -c -
+
+
+          lipo "$studio" -verify_arch arm64
+
+
+          printf 'EXACT_CURRENT_STUDIO_BINARY_VERIFIED; not launched and no qualification issued\n' > "$report/studio-scope.txt"
+
+
+          if ! curl --fail --location --silent --proto '=https' --tlsv1.2 'https://download.deepseek.com/dsh-desk/feeds/mac-arm64/nightly-mac.yml' -o "$report/deepseek-official-feed.yml" 2>/dev/null; then
+            printf 'OFFICIAL_DEEPSEEK_FEED_FETCH_FAILED\n'; exit 1
+          fi
+          python3 - "$report" <<'PYFEED'
+          import pathlib,re,sys
+          p=pathlib.Path(sys.argv[1])/'deepseek-official-feed.yml';text=p.read_text()
+          expected={'version':'0.2.1-rc.3','url':'https://download.deepseek.com/dsh-desk/bin/mac-arm64/deepseek-harness-0.2.1-rc.3-mac-arm64.zip','sha512':'0tCeP/zLGLtsH+S4BD4TIyRJ8TwRhh7xaJprTMOUoEfj7hYJFC3G5l6nl/2zCTS41MeE9k+KRN19RE9sqX6goQ==','size':'347702586'}
+          if p.stat().st_size>65536 or not re.search(r'^version:\s*[\'\"]?'+re.escape(expected['version'])+r'[\'\"]?\s*$',text,re.M) or any(v not in text for v in (expected['url'],expected['sha512'],expected['size'])):raise SystemExit('OFFICIAL_FEED_CHANGED_REQUALIFICATION_REQUIRED')
+          PYFEED
+          if ! curl --fail --location --silent --proto '=https' --tlsv1.2 'https://download.deepseek.com/dsh-desk/bin/mac-arm64/deepseek-harness-0.2.1-rc.3-mac-arm64.zip' -o "$work/input/deepseek-current.zip" 2>/dev/null; then
+            printf 'OFFICIAL_DEEPSEEK_ZIP_FETCH_FAILED\n'; exit 1
+          fi
+          python3 - "$work/input/deepseek-current.zip" "$report" <<'PYZIP'
+          import base64,hashlib,json,pathlib,sys
+          p=pathlib.Path(sys.argv[1]);report=pathlib.Path(sys.argv[2]);expected='0tCeP/zLGLtsH+S4BD4TIyRJ8TwRhh7xaJprTMOUoEfj7hYJFC3G5l6nl/2zCTS41MeE9k+KRN19RE9sqX6goQ=='
+          if p.stat().st_size!=347702586:raise SystemExit('OFFICIAL_DEEPSEEK_ZIP_SIZE_DIFFERS')
+          h=hashlib.sha512()
+          with p.open('rb') as f:
+              for block in iter(lambda:f.read(1024*1024),b''):h.update(block)
+          if base64.b64encode(h.digest()).decode()!=expected:raise SystemExit('OFFICIAL_DEEPSEEK_ZIP_SHA512_DIFFERS')
+          out={'platform':'mac-arm64','channel':'nightly/preview','version':'0.2.1-rc.3','url':'https://download.deepseek.com/dsh-desk/bin/mac-arm64/deepseek-harness-0.2.1-rc.3-mac-arm64.zip','bytes':p.stat().st_size,'sha512Base64':expected,'freshFeedSha256':hashlib.sha256((report/'deepseek-official-feed.yml').read_bytes()).hexdigest(),'scope':'Separate latest DeepSeek input; immutable existing DMG is reused for Hermes only'}
+          (report/'deepseek-official-input.json').write_text(json.dumps(out,indent=2))
+          PYZIP
+          mkdir -p "$work/deepseek-current"
+          ditto -x -k "$work/input/deepseek-current.zip" "$work/deepseek-current"
+          if ! curl --fail --location --silent --proto '=https' --tlsv1.2 "$AIWS_ARM_IMAGE_URL" -o "$work/input/arm64.dmg" 2>/dev/null; then
+
+
+            printf 'PRIVATE_IMAGE_FETCH_FAILED\n'; exit 1
+
+
+          fi
+
+
+          unset AIWS_ARM_IMAGE_URL
+          test "$(stat -f '%z' "$work/input/arm64.dmg")" = 1958354872
+          printf '%s  %s\n' '36b5489eefdb498929632674571c856b12300ad732581497f9d7b5b5133153fd' "$work/input/arm64.dmg" | shasum -a 256 -c -
+          hdiutil attach "$work/input/arm64.dmg" -readonly -nobrowse -mountpoint "$mount" > "$report/mount.txt"
+
+
+          python3 - "$mount" "$report" "$work/deepseek-current" > "$work/components.tsv" <<'PYPLAN'
+
+
+          import hashlib,json,pathlib,plistlib,re,sys
+          root=pathlib.Path(sys.argv[1]).resolve();report=pathlib.Path(sys.argv[2]);current=pathlib.Path(sys.argv[3]).resolve()
+          source=json.loads((root/'native-components.json').read_text())
+          components=source.get('components') if isinstance(source,dict) else None
+          if not isinstance(source,dict) or source.get('schema')!=1 or source.get('architecture')!='arm64' or not isinstance(components,list) or len(components)!=2 or {c.get('id') for c in components if isinstance(c,dict)}!={'hermes','deepseek'}:raise SystemExit('IMAGE_DESCRIPTOR_SCHEMA_REFUSED')
+          (report/'immutable-image-descriptor.json').write_text(json.dumps(source,indent=2))
+          rows=[]
+          for c in components:
+              if c['id']=='deepseek':continue
+              if c.get('bundle') not in {'Hermes Agent.app','Hermes Agent e06df9c.app'}:raise SystemExit('COMPONENT_BUNDLE_REFUSED')
+              app=(root/c['bundle']).resolve()
+              if not app.is_relative_to(root) or app.suffix!='.app':raise SystemExit('COMPONENT_PATH_REFUSED')
+              info_file=app/'Contents/Info.plist';info=plistlib.loads(info_file.read_bytes());bid=info['CFBundleIdentifier'];exe=info['CFBundleExecutable']
+              if not re.fullmatch(r'[A-Za-z0-9_.-]+',bid) or '/' in exe or '\\' in exe or exe in ('.','..'):raise SystemExit('COMPONENT_ID_REFUSED')
+              entry=app/'Contents/MacOS'/exe
+              if c.get('entry')!='Contents/MacOS/'+exe or c.get('bundleIdentifier')!=bid or c.get('version')!=info['CFBundleShortVersionString']:raise SystemExit('COMPONENT_INFO_DIFFERS_FROM_DESCRIPTOR')
+              if info_file.is_symlink() or entry.is_symlink() or hashlib.sha256(info_file.read_bytes()).hexdigest()!=c.get('infoSHA256') or hashlib.sha256(entry.read_bytes()).hexdigest()!=c.get('entrySHA256'):raise SystemExit('COMPONENT_BYTES_DIFFER_FROM_DESCRIPTOR')
+              rows.append({'id':'hermes','bundle':str(app),'bundleIdentifier':bid,'entry':str(entry),'version':c['version'],'source':'Exact immutable private DMG'})
+          app=(current/'DeepSeek Harness.app').resolve()
+          if not app.is_relative_to(current) or not app.is_dir():raise SystemExit('OFFICIAL_DEEPSEEK_LAYOUT_REFUSED')
+          info_file=app/'Contents/Info.plist';info=plistlib.loads(info_file.read_bytes());bid=info['CFBundleIdentifier'];exe=info['CFBundleExecutable']
+          if bid!='com.deepseek.dsh' or info['CFBundleShortVersionString']!='0.2.1-rc.3' or '/' in exe or '\\' in exe or exe in ('.','..'):raise SystemExit('OFFICIAL_DEEPSEEK_IDENTITY_DIFFERS')
+          entry=app/'Contents/MacOS'/exe
+          if info_file.is_symlink() or entry.is_symlink() or not entry.is_file():raise SystemExit('OFFICIAL_DEEPSEEK_ENTRY_REFUSED')
+          rows.append({'id':'deepseek','bundle':str(app),'bundleIdentifier':bid,'entry':str(entry),'version':info['CFBundleShortVersionString'],'source':'Fresh exact official mac-arm64 rc3 ZIP','infoSHA256':hashlib.sha256(info_file.read_bytes()).hexdigest(),'entrySHA256':hashlib.sha256(entry.read_bytes()).hexdigest()})
+          if len(rows)!=2 or len({r['bundleIdentifier'] for r in rows})!=2:raise SystemExit('EXPECTED_TWO_DISTINCT_COMPONENTS')
+          (report/'components.json').write_text(json.dumps(rows,indent=2))
+          for r in rows:print('\t'.join([r['id'],r['bundle'],r['bundleIdentifier'],r['entry']]))
+          PYPLAN
+
+
+          while IFS=$'\t' read -r label app bundle_id entry; do
+
+
+            lipo "$entry" -verify_arch arm64
+
+
+            codesign --verify --deep --strict "$app" >"$report/$label-codesign.txt" 2>&1
+
+
+            userdata="$work/userdata/$label"
+
+
+            mkdir -p "$userdata"
+
+
+            open -n "$app" --args --user-data-dir="$userdata"
+
+
+            current_pid=""
+
+
+            windows=0
+
+
+            for ((attempt=1; attempt<=90; attempt++)); do
+
+
+              observed="$(osascript -e 'with timeout of 10 seconds' -e "tell application \"System Events\" to if exists (first process whose bundle identifier is \"$bundle_id\") then return (unix id of first process whose bundle identifier is \"$bundle_id\") as string & \"|\" & (count windows of first process whose bundle identifier is \"$bundle_id\")" -e 'end timeout')"
+
+
+              if test -n "$observed"; then
+
+
+                current_pid="${observed%%|*}"
+
+
+                windows="${observed##*|}"
+
+
+                if test "$windows" -gt 0; then break; fi
+
+
+              fi
+
+
+              sleep 2
+
+
+            done
+
+
+            test -n "$current_pid" && test "$windows" -gt 0
+
+
+            printf 'PID=%s\nWINDOWS=%s\n' "$current_pid" "$windows" > "$report/$label-window.txt"
+
+
+            osascript -e 'with timeout of 10 seconds' -e "tell application \"System Events\" to set frontmost of first process whose unix id is $current_pid to true" -e 'end timeout'
+
+
+            sample "$current_pid" 1 1 -file "$report/$label-process-sample.txt" >/dev/null 2>&1
+
+
             grep -Eiq '^[[:space:]]*(Code Type|Architecture):[[:space:]]*(ARM-64|ARM64)([[:space:](]|$)' "$report/$label-process-sample.txt"
-            if grep -Eiq '^[[:space:]]*Code Type:.*(X86|Translated)' "$report/$label-process-sample.txt"; then exit 1; fi
-            osascript -e 'with timeout of 10 seconds' -e "tell application \"System Events\" to get name of front window of first process whose unix id is $current_pid" -e 'end timeout' > "$report/$label-window-title.txt"
-            screencapture -x "$report/$label-gui.png"
-            test -s "$report/$label-gui.png"
-            osascript -e 'with timeout of 10 seconds' -e "tell application \"System Events\" to tell first process whose unix id is $current_pid to keystroke \"q\" using command down" -e 'end timeout'
-            for attempt in $(seq 1 30); do
-              if ! kill -0 "$current_pid" 2>/dev/null; then break; fi
-              sleep 1
-            done
-            if kill -0 "$current_pid" 2>/dev/null; then printf 'NORMAL_QUIT_FAILED\n' > "$report/$label-result.txt"; exit 1; fi
-            printf 'EXACT_INPUT=PASS\nARM64_NATIVE_PROCESS=PASS\nREAL_WINDOW=PASS\nSCREENSHOT=CREATED_REQUIRES_REVIEW\nNORMAL_CMD_Q_EXIT=PASS\nEXIT_CODE=UNKNOWN_LAUNCHSERVICES\nMODEL_DIALOGUE=NOT_TESTED\nREAL_USB=NOT_TESTED\n' > "$report/$label-result.txt"
-            current_pid=""
-          done < "$work/components.tsv"
-          python3 - "$report" <<'PYSUMMARY'
-          import json,pathlib,sys
-          p=pathlib.Path(sys.argv[1]);rows=json.loads((p/'components.json').read_text())
-          out={'status':'NATIVE_COMPONENT_GUI_SMOKE_PASS_REQUIRES_IMAGE_REVIEW','components':[r['id'] for r in rows],'arch':'arm64','normalQuitObserved':True,'exitCode':'UNKNOWN_LAUNCHSERVICES','studioBinaryVerifiedOnly':True,'qualificationIssued':False,'modelConversation':'NOT_TESTED','buyerProfileFlow':'NOT_TESTED','realPhysicalUsb':'NOT_TESTED'}
-          (p/'summary.json').write_text(json.dumps(out,indent=2))
-          PYSUMMARY
-      - name: Encrypt bounded private evidence
-        id: seal
-        if: always()
-        env:
-          AIWS_ARM_REPORT_KEY: ${{ secrets.AIWS_ARM_REPORT_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$AIWS_ARM_REPORT_KEY"
-          command -v gpg >/dev/null
-          work="$RUNNER_TEMP/aiws-private-native"
-          mkdir -p "$work/report"
-          total="$(du -sk "$work/report" | awk '{print $1}')"
-          test "$total" -le 20480
-          tar -C "$work/report" -czf "$work/report.tar.gz" .
-          printf '%s' "$AIWS_ARM_REPORT_KEY" | gpg --batch --yes --pinentry-mode loopback --symmetric --cipher-algo AES256 --passphrase-fd 0 --output "$work/report.gpg" "$work/report.tar.gz" 2>/dev/null
-          test -s "$work/report.gpg"
-          printf 'sealed=true\n' >> "$GITHUB_OUTPUT"
-      - name: Keep encrypted evidence for local readback
-        if: always() && steps.seal.outputs.sealed == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: private-arm-native-report-encrypted
-          path: ${{ runner.temp }}/aiws-private-native/report.gpg
-          retention-days: 1
-          if-no-files-found: error
+
+            if grep -Eiq '^[[:space:]]*Code Type:.*(X86|Translated)' "$report/$label-process-sample.txt"; then exit 1; fi
+
+
+            osascript -e 'with timeout of 10 seconds' -e "tell application \"System Events\" to get name of front window of first process whose unix id is $current_pid" -e 'end timeout' > "$report/$label-window-title.txt"
+
+
+            screencapture -x "$report/$label-gui.png"
+
+
+            test -s "$report/$label-gui.png"
+
+
+            osascript -e 'with timeout of 10 seconds' -e "tell application \"System Events\" to tell first process whose unix id is $current_pid to keystroke \"q\" using command down" -e 'end timeout'
+
+
+            for ((attempt=1; attempt<=30; attempt++)); do
+
+
+              if ! kill -0 "$current_pid" 2>/dev/null; then break; fi
+
+
+              sleep 1
+
+
+            done
+
+
+            if kill -0 "$current_pid" 2>/dev/null; then printf 'NORMAL_QUIT_FAILED\n' > "$report/$label-result.txt"; exit 1; fi
+
+
+            printf 'EXACT_INPUT=PASS\nARM64_NATIVE_PROCESS=PASS\nREAL_WINDOW=PASS\nSCREENSHOT=CREATED_REQUIRES_REVIEW\nNORMAL_CMD_Q_EXIT=PASS\nEXIT_CODE=UNKNOWN_LAUNCHSERVICES\nMODEL_DIALOGUE=NOT_TESTED\nREAL_USB=NOT_TESTED\n' > "$report/$label-result.txt"
+
+
+            current_pid=""
+
+
+          done < "$work/components.tsv"
+
+
+          python3 - "$report" <<'PYSUMMARY'
+
+
+          import json,pathlib,sys
+
+
+          p=pathlib.Path(sys.argv[1]);rows=json.loads((p/'components.json').read_text())
+
+
+          out={'status':'NATIVE_COMPONENT_GUI_SMOKE_PASS_REQUIRES_IMAGE_REVIEW','components':[r['id'] for r in rows],'arch':'arm64','normalQuitObserved':True,'exitCode':'UNKNOWN_LAUNCHSERVICES','studioBinaryVerifiedOnly':True,'qualificationIssued':False,'modelConversation':'NOT_TESTED','buyerProfileFlow':'NOT_TESTED','realPhysicalUsb':'NOT_TESTED'}
+
+
+          (p/'summary.json').write_text(json.dumps(out,indent=2))
+
+
+          PYSUMMARY
+
+
+      - name: Encrypt bounded private evidence
+
+
+        id: seal
+
+
+        if: always()
+
+
+        env:
+
+
+          AIWS_ARM_REPORT_KEY: ${{ secrets.AIWS_ARM_REPORT_KEY }}
+
+
+        shell: bash
+
+
+        run: |
+
+
+          set -euo pipefail
+
+
+          test -n "$AIWS_ARM_REPORT_KEY"
+
+
+          command -v gpg >/dev/null
+
+
+          work="$RUNNER_TEMP/aiws-private-native"
+
+
+          mkdir -p "$work/report"
+
+
+          total="$(du -sk "$work/report" | awk '{print $1}')"
+
+
+          test "$total" -le 20480
+
+
+          tar -C "$work/report" -czf "$work/report.tar.gz" .
+
+
+          printf '%s' "$AIWS_ARM_REPORT_KEY" | gpg --batch --yes --pinentry-mode loopback --symmetric --cipher-algo AES256 --passphrase-fd 0 --output "$work/report.gpg" "$work/report.tar.gz" 2>/dev/null
+
+
+          test -s "$work/report.gpg"
+
+
+          printf 'sealed=true\n' >> "$GITHUB_OUTPUT"
+
+
+      - name: Keep encrypted evidence for local readback
+
+
+        if: always() && steps.seal.outputs.sealed == 'true'
+
+
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+
+
+        with:
+
+
+          name: private-arm-native-report-encrypted
+
+
+          path: ${{ runner.temp }}/aiws-private-native/report.gpg
+
+
+          retention-days: 1
+
+
+          if-no-files-found: error
+
+
