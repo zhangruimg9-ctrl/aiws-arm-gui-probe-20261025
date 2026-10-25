@@ -88,6 +88,7 @@ jobs:
               printf 'PHASE=%s\nEXIT=%s\n' "$test_phase" "$status" > "$report/failure-phase.txt"
               screencapture -x "$report/failure-screen.png" >"$report/failure-capture.txt" 2>&1 || true
               if test -n "$current_pid"; then ps -p "$current_pid" -o pid,ppid,stat,comm >"$report/failure-process.txt" 2>&1 || true; fi
+              if test -n "$current_pid" && test -n "${bundle_id:-}" && type gui >/dev/null 2>&1; then gui diagnose "$bundle_id" "$current_pid" >"$report/failure-limited-ax.txt" 2>&1 || true; fi
             fi
             if test -z "$current_pid" || ! kill -0 "$current_pid" 2>/dev/null; then
               hdiutil detach "$mount" >"$report/detach.txt" 2>&1 || true
@@ -98,10 +99,141 @@ jobs:
           }
           trap cleanup EXIT
           cat > "$work/gui-driver.applescript" <<'ASDRIVER'
+          global axVisited, axPieces, axButtons, axDiagnostic, allDialogDiagnostics, dialogSubject
+          on flattenLabel(rawText)
+            set oldDelimiters to AppleScript's text item delimiters
+            set AppleScript's text item delimiters to {linefeed, return, tab}
+            set parts to text items of rawText
+            set AppleScript's text item delimiters to " "
+            set answer to parts as text
+            set AppleScript's text item delimiters to oldDelimiters
+            return answer
+          end flattenLabel
+          on walkAX(theElement, remainingDepth)
+            global axVisited, axPieces, axButtons, axDiagnostic
+            if remainingDepth < 0 or axVisited >= 400 then return
+            set axVisited to axVisited + 1
+            tell application "System Events"
+              try
+                set roleName to role of theElement as text
+              on error
+                return
+              end try
+              set labelText to ""
+              if roleName is in {"AXStaticText", "AXButton", "AXWindow", "AXDialog", "AXSheet"} then
+                try
+                  set labelText to name of theElement as text
+                  if labelText is "missing value" then set labelText to ""
+                  set labelText to my flattenLabel(labelText)
+                  if (length of labelText) > 180 then set labelText to text 1 thru 180 of labelText
+                end try
+              end if
+              if labelText is not "" then
+                set end of axPieces to labelText
+                if (count of axDiagnostic) < 80 then set end of axDiagnostic to roleName & "|" & labelText
+              end if
+              if roleName is "AXButton" and labelText is not "" then set end of axButtons to {labelText, theElement}
+              if remainingDepth > 0 and axVisited < 400 then
+                try
+                  set childrenList to UI elements of theElement
+                  repeat with childRef in childrenList
+                    if axVisited >= 400 then exit repeat
+                    my walkAX(contents of childRef, remainingDepth - 1)
+                  end repeat
+                end try
+              end if
+            end tell
+          end walkAX
+          on inspectKnownWindow(theWindow, wantedKind, scopeLabel)
+            global axVisited, axPieces, axButtons, axDiagnostic, allDialogDiagnostics, dialogSubject
+            set axVisited to 0
+            set axPieces to {}
+            set axButtons to {}
+            set axDiagnostic to {}
+            my walkAX(theWindow, 16)
+            set oldDelimiters to AppleScript's text item delimiters
+            set AppleScript's text item delimiters to " "
+            set messageText to axPieces as text
+            set AppleScript's text item delimiters to linefeed
+            set diagnosticText to axDiagnostic as text
+            set AppleScript's text item delimiters to oldDelimiters
+            if (length of allDialogDiagnostics) < 8192 then
+              set allDialogDiagnostics to allDialogDiagnostics & scopeLabel & linefeed & diagnosticText & linefeed
+              if (length of allDialogDiagnostics) > 8192 then set allDialogDiagnostics to text 1 thru 8192 of allDialogDiagnostics
+            end if
+            set chosenButtons to {}
+            set chosenName to ""
+            set hasKeepRunning to false
+            repeat with pairRef in axButtons
+              set buttonPair to contents of pairRef
+              set buttonLabel to item 1 of buttonPair
+              if buttonLabel is "Keep Running" then set hasKeepRunning to true
+              if wantedKind is "local-network" and buttonLabel is in {"Don't Allow", "Don’t Allow"} then
+                set end of chosenButtons to item 2 of buttonPair
+                set chosenName to buttonLabel
+              else if wantedKind is "hermes-quit" and buttonLabel is "Quit Anyway" then
+                set end of chosenButtons to item 2 of buttonPair
+                set chosenName to buttonLabel
+              end if
+            end repeat
+            set messageMatches to false
+            if wantedKind is "local-network" then
+              set messageMatches to ((messageText contains dialogSubject) and (messageText contains "find devices on local networks"))
+            else if wantedKind is "hermes-quit" then
+              set messageMatches to ((messageText contains "Hermes is still working on 1 chat") and hasKeepRunning)
+            end if
+            if messageMatches and (count of chosenButtons) is 1 then
+              set chosenButton to item 1 of chosenButtons
+              tell application "System Events"
+                if not (enabled of chosenButton) then error "EXACT_KNOWN_DIALOG_BUTTON_DISABLED"
+                perform action "AXPress" of chosenButton
+              end tell
+              delay 0.3
+              return "CLICKED_EXACT:" & chosenName
+            end if
+            if messageMatches and (count of chosenButtons) > 1 then error "EXACT_DIALOG_BUTTON_AMBIGUOUS"
+            return missing value
+          end inspectKnownWindow
+          on inspectProcessWindows(targetProcess, wantedKind, scopeLabel)
+            tell application "System Events"
+              set ownedWindows to windows of targetProcess
+              set windowCount to count of ownedWindows
+            end tell
+            if windowCount > 4 then error "DIALOG_INSPECTION_WINDOW_BOUND_EXCEEDED"
+            repeat with windowRef in ownedWindows
+              set answer to my inspectKnownWindow(contents of windowRef, wantedKind, scopeLabel)
+              if answer is not missing value then return answer
+            end repeat
+            return missing value
+          end inspectProcessWindows
+          on handleKnownDialog(ownedProcess, wantedKind)
+            global allDialogDiagnostics
+            set allDialogDiagnostics to ""
+            set answer to my inspectProcessWindows(ownedProcess, wantedKind, "OWNED_PINNED_COMPONENT_PROCESS")
+            if answer is not missing value then return answer
+            if wantedKind is in {"local-network", "diagnose"} then
+              repeat with trustedRef in {"com.apple.UserNotificationCenter", "com.apple.CoreServicesUIAgent", "com.apple.controlcenter"}
+                set trustedBundle to contents of trustedRef
+                tell application "System Events"
+                  set systemMatches to every application process whose bundle identifier is trustedBundle
+                end tell
+                if (count of systemMatches) > 1 then error "TRUSTED_SYSTEM_PROCESS_AMBIGUOUS"
+                if (count of systemMatches) is 1 then
+                  set answer to my inspectProcessWindows(item 1 of systemMatches, wantedKind, trustedBundle)
+                  if answer is not missing value then return answer
+                end if
+              end repeat
+            end if
+            return "NO_EXACT_KNOWN_DIALOG" & linefeed & allDialogDiagnostics
+          end handleKnownDialog
           on run argv
+            global dialogSubject
             set operation to item 1 of argv
             set wantedBundle to item 2 of argv
             set expectedPID to (item 3 of argv) as integer
+            set dialogSubject to ""
+            if wantedBundle is "com.nousresearch.hermes-bundled" then set dialogSubject to "Hermes Agent"
+            if wantedBundle is "com.deepseek.dsh" then set dialogSubject to "DeepSeek Harness"
             with timeout of 10 seconds
               tell application "System Events"
                 if expectedPID > 0 then
@@ -111,6 +243,7 @@ jobs:
                 end if
                 if (count of matches) is 0 then
                   if operation is "query" then return "0|0"
+                  if operation is in {"deny-local-network", "confirm-hermes-quit", "diagnose"} then return "OWNED_PROCESS_NOT_PRESENT"
                   error "OWNED_PROCESS_MISSING_BEFORE_GUI_ACTION"
                 end if
                 set ownedProcess to item 1 of matches
@@ -129,6 +262,14 @@ jobs:
                     if (count of windows) is 0 then return ""
                     return name of front window
                   end tell
+                else if operation is in {"deny-local-network", "confirm-hermes-quit", "diagnose"} then
+                  if dialogSubject is "" then return "PINNED_COMPONENT_CONFIRMATION_NOT_APPLICABLE"
+                  if operation is "deny-local-network" then return my handleKnownDialog(ownedProcess, "local-network")
+                  if operation is "confirm-hermes-quit" then
+                    if wantedBundle is not "com.nousresearch.hermes-bundled" then return "HERMES_QUIT_CONFIRMATION_NOT_APPLICABLE"
+                    return my handleKnownDialog(ownedProcess, "hermes-quit")
+                  end if
+                  return my handleKnownDialog(ownedProcess, "diagnose")
                 else if operation is "quit" then
                   tell ownedProcess
                     set frontmost to true
@@ -233,11 +374,11 @@ jobs:
           import base64,hashlib,json,pathlib,sys
           p=pathlib.Path(sys.argv[1]);report=pathlib.Path(sys.argv[2]);expected='0tCeP/zLGLtsH+S4BD4TIyRJ8TwRhh7xaJprTMOUoEfj7hYJFC3G5l6nl/2zCTS41MeE9k+KRN19RE9sqX6goQ=='
           if p.stat().st_size!=347702586:raise SystemExit('OFFICIAL_DEEPSEEK_ZIP_SIZE_DIFFERS')
-          h=hashlib.sha512()
+          h=hashlib.sha512();h256=hashlib.sha256()
           with p.open('rb') as f:
-              for block in iter(lambda:f.read(1024*1024),b''):h.update(block)
+              for block in iter(lambda:f.read(1024*1024),b''):h.update(block);h256.update(block)
           if base64.b64encode(h.digest()).decode()!=expected:raise SystemExit('OFFICIAL_DEEPSEEK_ZIP_SHA512_DIFFERS')
-          out={'platform':'mac-arm64','channel':'nightly/preview','version':'0.2.1-rc.3','url':'https://download.deepseek.com/dsh-desk/bin/mac-arm64/deepseek-harness-0.2.1-rc.3-mac-arm64.zip','bytes':p.stat().st_size,'sha512Base64':expected,'freshFeedSha256':hashlib.sha256((report/'deepseek-official-feed.yml').read_bytes()).hexdigest(),'scope':'Separate latest DeepSeek input; immutable existing DMG is reused for Hermes only'}
+          out={'platform':'mac-arm64','channel':'nightly/preview','version':'0.2.1-rc.3','url':'https://download.deepseek.com/dsh-desk/bin/mac-arm64/deepseek-harness-0.2.1-rc.3-mac-arm64.zip','bytes':p.stat().st_size,'sha512Base64':expected,'sha256':h256.hexdigest(),'freshFeedSha256':hashlib.sha256((report/'deepseek-official-feed.yml').read_bytes()).hexdigest(),'scope':'Separate latest DeepSeek input; immutable existing DMG is reused for Hermes only'}
           (report/'deepseek-official-input.json').write_text(json.dumps(out,indent=2))
           PYZIP
           mkdir -p "$work/deepseek-current"
@@ -286,6 +427,7 @@ jobs:
           if info_file.is_symlink() or entry.is_symlink() or not entry.is_file():raise SystemExit('OFFICIAL_DEEPSEEK_ENTRY_REFUSED')
           rows.append({'id':'deepseek','bundle':str(app),'bundleIdentifier':bid,'entry':str(entry),'version':info['CFBundleShortVersionString'],'source':'Fresh exact official mac-arm64 rc3 ZIP','infoSHA256':hashlib.sha256(info_file.read_bytes()).hexdigest(),'entrySHA256':hashlib.sha256(entry.read_bytes()).hexdigest()})
           if len(rows)!=2 or len({r['bundleIdentifier'] for r in rows})!=2:raise SystemExit('EXPECTED_TWO_DISTINCT_COMPONENTS')
+          rows.sort(key=lambda r: 0 if r['id']=='deepseek' else 1)
           (report/'components.json').write_text(json.dumps(rows,indent=2))
           for r in rows:print('\t'.join([r['id'],r['bundle'],r['bundleIdentifier'],r['entry']]))
           PYPLAN
@@ -352,6 +494,10 @@ jobs:
 
 
             test_phase="component-$label/activate"
+            test_phase="component-$label/local-network-confirmation"
+            screencapture -x "$report/$label-before-local-network-check.png"
+            gui deny-local-network "$bundle_id" "$current_pid" > "$report/$label-local-network-check.txt"
+            screencapture -x "$report/$label-after-local-network-check.png"
             gui activate "$bundle_id" "$current_pid"
 
 
@@ -374,6 +520,14 @@ jobs:
 
             test_phase="component-$label/quit"
             gui quit "$bundle_id" "$current_pid"
+            if kill -0 "$current_pid" 2>/dev/null; then
+              sleep 1
+              screencapture -x "$report/$label-before-quit-confirmation.png"
+              gui deny-local-network "$bundle_id" "$current_pid" > "$report/$label-post-quit-local-network-check.txt"
+              if test "$label" = hermes; then gui confirm-hermes-quit "$bundle_id" "$current_pid" > "$report/hermes-quit-confirmation.txt"; fi
+              screencapture -x "$report/$label-after-quit-confirmation.png"
+            fi
+
 
 
             for ((attempt=1; attempt<=30; attempt++)); do
