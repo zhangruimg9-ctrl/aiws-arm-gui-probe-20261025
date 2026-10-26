@@ -1,0 +1,100 @@
+name: Public ARM external form input capability
+run-name: Public ARM input ${{ inputs.probe_nonce }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe_nonce:
+        description: Public once-owned probe nonce, not a secret
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aiws-public-arm-external-input-once
+  cancel-in-progress: false
+
+jobs:
+  public-input:
+    if: github.repository == 'zhangruimg9-ctrl/aiws-arm-gui-probe-20261025' && github.event.repository.private == false
+    runs-on: macos-15
+    timeout-minutes: 8
+    steps:
+      - name: Read only this public self-owned probe source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout: probe/AppInputProbe.swift
+          sparse-checkout-cone-mode: false
+      - name: Compile self-owned public native form and external driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          work="$RUNNER_TEMP/aiws-public-input-$GITHUB_RUN_ID"
+          mkdir -m 700 "$work"
+          app="$work/AppInputProbe.app"
+          mkdir -p "$app/Contents/MacOS"
+          swiftc -swift-version 5 -framework AppKit -framework ApplicationServices -framework CoreGraphics probe/AppInputProbe.swift -o "$app/Contents/MacOS/AppInputProbe"
+          /usr/bin/python3 - "$app/Contents/Info.plist" <<'PY'
+          import plistlib,sys
+          value={'CFBundleIdentifier':'local.aiws.publicinputprobe','CFBundleName':'AIWS Public Input Probe',
+                 'CFBundleExecutable':'AppInputProbe','CFBundlePackageType':'APPL','LSMinimumSystemVersion':'13.0'}
+          with open(sys.argv[1],'wb') as output:plistlib.dump(value,output)
+          PY
+      - name: External PID-bound input and button action (read-only permission preflight)
+        shell: bash
+        env:
+          PROBE_NONCE: ${{ inputs.probe_nonce }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/aiws-public-input-$GITHUB_RUN_ID"
+          app="$work/AppInputProbe.app"
+          /usr/bin/python3 - <<'PY'
+          import os,re
+          if not re.fullmatch('[A-Z0-9_-]{1,60}',os.environ['PROBE_NONCE']):raise SystemExit('INVALID_PUBLIC_NONCE')
+          PY
+          /usr/bin/open -n "$app" --args "$work/form-saved.json"
+          /usr/bin/python3 - "$work/form-saved.json.ready.json" <<'PY'
+          import pathlib,sys,time
+          path=pathlib.Path(sys.argv[1]);deadline=time.monotonic()+10
+          while not path.exists() and time.monotonic()<deadline:time.sleep(.1)
+          if not path.exists():raise SystemExit('PUBLIC_FORM_READY_NOT_OBSERVED')
+          PY
+          pid="$(/usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["appPid"])' "$work/form-saved.json.ready.json")"
+          set +e
+          "$app/Contents/MacOS/AppInputProbe" --drive "$pid" "AIWS_PUBLIC_INPUT_PROBE_$PROBE_NONCE" "$work/form-saved.json" > "$work/driver-result.json"
+          code=$?
+          set -e
+          /usr/bin/python3 - "$work/driver-result.json" "$code" <<'PY'
+          import json,pathlib,sys,os
+          result=json.loads(pathlib.Path(sys.argv[1]).read_text());result['driverExitCode']=int(sys.argv[2])
+          result['runId']=int(os.environ['GITHUB_RUN_ID']);result['probeNonce']=os.environ['PROBE_NONCE']
+          print('AIWS_GENERIC_INPUT_RESULT='+json.dumps(result,separators=(',',':'),sort_keys=True))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as output:
+              output.write('Public self-owned form capability: '+result.get('status','UNKNOWN')+'\n')
+              output.write('No product/model/secret/TCC changes/cache/artifact involved.\n')
+          if result.get('status')=='UNAVAILABLE' and int(sys.argv[2])==78:raise SystemExit(0)
+          if result.get('status')!='GENERIC_EXTERNAL_INPUT_PASS' or int(sys.argv[2])!=0:raise SystemExit(1)
+          PY
+      - name: Remove only this public probe temporary files after normal exit
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json,os,pathlib,shutil
+          base=pathlib.Path(os.environ['RUNNER_TEMP']).resolve()
+          work=base/('aiws-public-input-'+os.environ['GITHUB_RUN_ID'])
+          result=work/'driver-result.json'
+          if work.is_dir() and result.is_file():
+              data=json.loads(result.read_text())
+              if data.get('normalExitObserved') is True and work.resolve().parent==base:
+                  shutil.rmtree(work)
+                  print('PUBLIC_PROBE_OWNED_TEMP_REMOVED')
+              else:print('PUBLIC_PROBE_NORMAL_EXIT_UNPROVEN_NO_FORCE_OR_BLIND_DELETE')
+          else:print('PUBLIC_PROBE_NO_OWNED_DRIVER_RESULT; ephemeral runner cleanup remains')
+          PY
