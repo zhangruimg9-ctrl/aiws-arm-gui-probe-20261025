@@ -1,0 +1,122 @@
+name: Once-authorized encrypted ARM interactive bootstrap
+run-name: ARM functional ${{ inputs.nonce }}
+on:
+  workflow_dispatch:
+    inputs:
+      attempt_id: {required: true, type: string}
+      authorization_id: {required: true, type: string}
+      nonce: {required: true, type: string}
+      plan_sha256: {required: true, type: string}
+      secret_prefix: {required: true, type: string}
+      zero_spend_evidence_sha256: {required: true, type: string}
+      packet_cipher_sha256: {required: true, type: string}
+      dmg_cipher_sha256: {required: true, type: string}
+permissions:
+  contents: write
+concurrency:
+  group: aiws-arm-functional-one-owned-case
+  cancel-in-progress: false
+jobs:
+  interactive:
+    # This mode requires a new explicit human grant in the immutable encrypted
+    # plan. The controller never auto-switches from unknown private minutes.
+    if: github.repository == 'zhangruimg9-ctrl/aiws-arm-gui-probe-20261025' && github.event.repository.private == false
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Validate public metadata before reading temporary access
+        shell: bash
+        env:
+          QA_ATTEMPT: ${{ inputs.attempt_id }}
+          QA_NONCE: ${{ inputs.nonce }}
+          QA_PREFIX: ${{ inputs.secret_prefix }}
+          QA_PLAN: ${{ inputs.plan_sha256 }}
+          QA_FREE: ${{ inputs.zero_spend_evidence_sha256 }}
+          QA_PACKET: ${{ inputs.packet_cipher_sha256 }}
+          QA_LARGE: ${{ inputs.dmg_cipher_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os,re,platform,uuid
+          uuid.UUID(os.environ['QA_ATTEMPT'])
+          nonce=os.environ['QA_NONCE']
+          if not re.fullmatch('[0-9a-f]{32}',nonce):raise SystemExit('NONCE_REFUSED')
+          if os.environ['QA_PREFIX']!='AIWS_ARM_QA_'+nonce[:12].upper()+'_':raise SystemExit('PREFIX_REFUSED')
+          for key in ['QA_PLAN','QA_FREE','QA_PACKET','QA_LARGE']:
+              if not re.fullmatch('[0-9a-f]{64}',os.environ[key]):raise SystemExit('PIN_REFUSED')
+          if platform.machine()!='arm64' or os.environ.get('RUNNER_ENVIRONMENT')!='github-hosted':raise SystemExit('STANDARD_ARM_HOST_REQUIRED')
+          PY
+      - name: Authenticate bounded encrypted private bootstrap
+        shell: bash
+        env:
+          QA_PACKET_URL: ${{ secrets[format('{0}PACKET_URL', inputs.secret_prefix)] }}
+          QA_INPUT_KEY: ${{ secrets[format('{0}INPUT_KEY', inputs.secret_prefix)] }}
+          QA_PACKET_CIPHER_SHA256: ${{ inputs.packet_cipher_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,os,pathlib,shutil,stat,subprocess,tempfile,urllib.request,zipfile
+          from urllib.parse import urlsplit
+          work=pathlib.Path(os.environ['RUNNER_TEMP'])/('aiws-functional-'+os.environ['GITHUB_RUN_ID'])
+          work.mkdir(mode=0o700)
+          def safe(url):
+              p=urlsplit(url)
+              if p.scheme!='https' or p.hostname not in {'release-assets.githubusercontent.com','objects.githubusercontent.com'} or p.username or p.password or p.port not in (None,443):raise ValueError('HOST_REFUSED')
+          class Redirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,request,fp,code,msg,headers,url):
+                  safe(url);return super().redirect_request(request,fp,code,msg,headers,url)
+          url=os.environ.pop('QA_PACKET_URL');safe(url)
+          cipher=work/'packet.gpg';total=0;h=hashlib.sha256()
+          try:
+              with urllib.request.build_opener(Redirect()).open(url,timeout=60) as incoming,cipher.open('xb') as output:
+                  while True:
+                      b=incoming.read(1048576)
+                      if not b:break
+                      total+=len(b)
+                      if total>42*1048576:raise ValueError('BOUND')
+                      h.update(b);output.write(b)
+              if h.hexdigest()!=os.environ['QA_PACKET_CIPHER_SHA256']:raise ValueError('DIGEST')
+              home=pathlib.Path(tempfile.mkdtemp(prefix='qg-',dir=os.environ['RUNNER_TEMP']));home.chmod(0o700)
+              plain=work/'packet.zip';key=os.environ.pop('QA_INPUT_KEY')
+              try:
+                  result=subprocess.run(['gpg','--homedir',str(home),'--batch','--yes','--no-symkey-cache','--pinentry-mode','loopback','--passphrase-fd','0','--status-fd','2','--output',str(plain),'--decrypt',str(cipher)],input=key.encode()+b'\n',stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=120)
+                  key=''
+                  if result.returncode or b'[GNUPG:] GOODMDC' not in result.stderr:raise ValueError('MDC')
+              finally:
+                  stopped=subprocess.run(['gpgconf','--homedir',str(home),'--kill','gpg-agent'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=15)
+                  if stopped.returncode:raise ValueError('OWNED_GPG_STOP_UNPROVEN')
+                  shutil.rmtree(home)
+              with zipfile.ZipFile(plain) as archive:
+                  rows=archive.infolist()
+                  if len(rows)>1300 or sum(x.file_size for x in rows)>40*1048576:raise ValueError('ZIP_BOUND')
+                  for row in rows:
+                      p=pathlib.PurePosixPath(row.filename)
+                      if p.is_absolute() or '..' in p.parts or not p.parts or p.parts[0] not in {'carrier','qa','reuse'} or stat.S_ISLNK(row.external_attr>>16):raise ValueError('ZIP_PATH')
+                  archive.extractall(work)
+              cipher.unlink();plain.unlink()
+          except Exception:raise SystemExit('ENCRYPTED_BOOTSTRAP_FAILED_NO_RAW_ACCESS_LOG')
+          PY
+      - name: Run source-pinned private interactive case owner
+        shell: bash
+        env:
+          AIWS_QA_ATTEMPT_ID: ${{ inputs.attempt_id }}
+          AIWS_QA_AUTHORIZATION_ID: ${{ inputs.authorization_id }}
+          AIWS_QA_NONCE: ${{ inputs.nonce }}
+          AIWS_QA_PLAN_SHA256: ${{ inputs.plan_sha256 }}
+          AIWS_QA_ZERO_SPEND_EVIDENCE_SHA256: ${{ inputs.zero_spend_evidence_sha256 }}
+          AIWS_QA_DMG_CIPHER_SHA256: ${{ inputs.dmg_cipher_sha256 }}
+          QA_DMG_URL: ${{ secrets[format('{0}DMG_URL', inputs.secret_prefix)] }}
+          QA_INPUT_KEY: ${{ secrets[format('{0}INPUT_KEY', inputs.secret_prefix)] }}
+          QA_CONTROL_TOKEN: ${{ secrets[format('{0}CONTROL_TOKEN', inputs.secret_prefix)] }}
+          QA_MODEL_TOKEN: ${{ secrets[format('{0}MODEL_TOKEN', inputs.secret_prefix)] }}
+          QA_REPORT_KEY: ${{ secrets[format('{0}REPORT_KEY', inputs.secret_prefix)] }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/aiws-functional-$GITHUB_RUN_ID"
+          python3 -B "$work/qa/run-arm-functional-qa.py" --runner-bootstrap "$work"
+      # No checkout/cache/Actions artifact/upload of plain or encrypted results.
+      # Only one HMAC-bound nonsensitive rendezvous draft is written publicly.
+      # Small encrypted evidence travels over the protected once-only HTTPS
+      # session; the local controller verifies it before normal shutdown and
+      # exact terminal GitHub cleanup. No product or model bodies go in logs.
